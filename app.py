@@ -2,14 +2,16 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
+import json
+from openai import OpenAI
 
 st.set_page_config(page_title="LeanCan", page_icon="🥫", layout="wide")
 
-st.title("🥫 LeanCan Scheduler")
+st.title("🥫 LeanCan Scheduler - IA con DeepSeek")
 
 # Configuración de Supabase
 SUPABASE_URL = "https://nubxhtlertuwmevxzuyd.supabase.co/rest/v1"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im51YnhodGxlcnR1d21ldnh6dXlkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMTI4ODYsImV4cCI6MjA5NTg4ODg4Nn0.sxXfypXZHyqFnXL1xeXdvVw925C6v-dg9Kg--7KNLWs"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im51YnhodGxlcnR1d21ldnh6dXlkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMTI4ODYsImV4cCI6MjA5NTg4ODg4Nn0.sxXfypXZHyqFnXL1xeXdvXw925C6v-dg9Kg--7KNLWs"
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -17,7 +19,6 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Funciones de base de datos
 def get_data(table):
     response = requests.get(f"{SUPABASE_URL}/{table}", headers=HEADERS)
     if response.status_code == 200:
@@ -26,16 +27,135 @@ def get_data(table):
 
 def insert_data(table, data):
     response = requests.post(f"{SUPABASE_URL}/{table}", headers=HEADERS, json=data)
-    return response.status_code == 201 or response.status_code == 200
+    return response.status_code in [200, 201]
 
 def delete_data(table, id_field, id_value):
     response = requests.delete(f"{SUPABASE_URL}/{table}?{id_field}=eq.{id_value}", headers=HEADERS)
     return response.status_code == 204
 
-# Menú principal
+# ============================================
+# IA REAL CON DEEPSEEK (GRATUITA)
+# ============================================
+def planificar_con_ia(maquinas, pedidos, clientes, productos):
+    """
+    Usa DeepSeek API (gratuita) para planificar la asignación de pedidos
+    """
+    if not maquinas or not pedidos:
+        return None
+    
+    # Preparar el contexto para la IA
+    contexto = f"""
+Eres un planificador experto de producción en una fábrica de conservas.
+
+## MÁQUINAS DISPONIBLES:
+{json.dumps(maquinas, indent=2, ensure_ascii=False)}
+
+## CLIENTES Y PRIORIDADES:
+{json.dumps(clientes, indent=2, ensure_ascii=False)}
+
+## PRODUCTOS:
+{json.dumps(productos, indent=2, ensure_ascii=False)}
+
+## PEDIDOS PENDIENTES:
+{json.dumps(pedidos, indent=2, ensure_ascii=False)}
+
+## REGLAS DE NEGOCIO:
+1. Cada pedido debe asignarse a UNA máquina
+2. No se puede exceder la capacidad diaria de cada máquina
+3. Los pedidos con RT (lleva_rt = true) SOLO pueden ir a la máquina E5
+4. Los pedidos pequeños (<20000 latas) pueden ir a cualquier máquina
+5. Los pedidos grandes (>80000 latas) conviene fragmentarlos (en realidad la IA decide)
+6. Priorizar pedidos con clientes de mayor prioridad y fechas más cercanas
+
+## INSTRUCCIONES:
+Analiza los pedidos y devuelve SOLO un JSON válido con este formato exacto:
+
+{{
+    "asignaciones": [
+        {{
+            "pedido_id": 1,
+            "pedido_numero": "P001",
+            "maquina_asignada": "E1",
+            "cantidad_asignada": 50000,
+            "justificacion": "Cliente prioritario, pedido urgente, máquina rápida"
+        }}
+    ],
+    "saturacion": {{
+        "E1": 45,
+        "E2": 0,
+        "E3": 0,
+        "E5": 30,
+        "E8": 0
+    }},
+    "analisis_general": "Resumen del razonamiento de la IA"
+}}
+"""
+    
+    try:
+        # Configurar cliente para DeepSeek (usa la misma interfaz que OpenAI)
+        client = OpenAI(
+            api_key=st.secrets["DEEPSEEK_API_KEY"],
+            base_url="https://api.deepseek.com"
+        )
+        
+        # Llamar a la IA
+        with st.spinner("🧠 DeepSeek IA está analizando los pedidos..."):
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "Eres un experto planificador de producción. Responde SOLO con JSON válido, sin texto adicional fuera del JSON."},
+                    {"role": "user", "content": contexto}
+                ],
+                temperature=0.3
+            )
+        
+        # Extraer respuesta
+        respuesta_texto = response.choices[0].message.content
+        
+        # Limpiar posible markdown
+        if respuesta_texto.startswith("```json"):
+            respuesta_texto = respuesta_texto[7:]
+        if respuesta_texto.endswith("```"):
+            respuesta_texto = respuesta_texto[:-3]
+        
+        # Parsear JSON
+        resultado = json.loads(respuesta_texto.strip())
+        return resultado
+        
+    except Exception as e:
+        st.error(f"Error llamando a DeepSeek IA: {e}")
+        st.code(respuesta_texto if 'respuesta_texto' in locals() else "No se pudo obtener respuesta")
+        return None
+
+# ============================================
+# CONFIGURACIÓN DE SECRETS EN STREAMLIT
+# ============================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔑 Configuración IA")
+
+deepseek_key_ok = False
+
+if "DEEPSEEK_API_KEY" in st.secrets:
+    deepseek_key_ok = True
+    st.sidebar.success("✅ API Key de DeepSeek configurada")
+else:
+    st.sidebar.warning("⚠️ Falta API Key de DeepSeek")
+    st.sidebar.info("Ve a Settings → Secrets y añade:\n\nDEEPSEEK_API_KEY = tu_clave")
+    
+    # Opción para ingresar la clave manualmente (solo para pruebas)
+    with st.sidebar.expander("🔧 Ingresar API Key manualmente"):
+        manual_key = st.text_input("DeepSeek API Key", type="password")
+        if manual_key:
+            st.session_state['manual_deepseek_key'] = manual_key
+            deepseek_key_ok = True
+            st.success("✅ Clave guardada temporalmente")
+
+# ============================================
+# MENÚ PRINCIPAL
+# ============================================
 menu = st.sidebar.radio(
     "📋 MENÚ PRINCIPAL",
-    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "🏭 Planificación"]
+    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "🤖 IA DeepSeek - Planificar"]
 )
 
 # ============================================
@@ -60,21 +180,15 @@ if menu == "📊 Dashboard":
     
     st.markdown("---")
     
-    # Mostrar máquinas
     st.subheader("🏭 Estado de Máquinas")
     if maquinas:
-        for m in maquinas:
-            col1, col2, col3, col4 = st.columns([2,2,2,1])
-            col1.write(f"**{m.get('nombre', 'N/A')}**")
-            col2.write(f"⚡ {m.get('velocidad', 0)} latas/min")
-            col3.write(f"📦 {m.get('capacidad', 0):,} latas/día")
-            col4.write(f"🎯 0%")
-        st.caption("La carga de trabajo se calculará cuando haya pedidos asignados")
+        df_maq = pd.DataFrame(maquinas)
+        st.dataframe(df_maq[['nombre', 'velocidad', 'capacidad', 'formato']], use_container_width=True)
     else:
         st.info("No hay máquinas registradas. Ve a 'Máquinas' para añadir.")
 
 # ============================================
-# MÁQUINAS (CRUD completo)
+# MÁQUINAS (CRUD)
 # ============================================
 elif menu == "⚙️ Máquinas":
     st.header("⚙️ Gestión de Máquinas")
@@ -90,7 +204,7 @@ elif menu == "⚙️ Máquinas":
                     col1.metric("Velocidad", f"{m.get('velocidad', 0)} latas/min")
                     col2.metric("Capacidad diaria", f"{m.get('capacidad', 0):,} latas")
                     col3.metric("Formato", m.get('formato', 'N/A'))
-                    if col4.button("🗑️ Eliminar", key=f"del_maq_{m.get('id')}"):
+                    if col4.button("🗑️", key=f"del_maq_{m.get('id')}"):
                         if delete_data("maquinas", "id", m.get('id')):
                             st.rerun()
         else:
@@ -115,11 +229,9 @@ elif menu == "⚙️ Máquinas":
                         "formato": formato
                     })
                     st.rerun()
-                else:
-                    st.error("El nombre es obligatorio")
 
 # ============================================
-# CLIENTES (CRUD completo)
+# CLIENTES (CRUD)
 # ============================================
 elif menu == "👥 Clientes":
     st.header("👥 Gestión de Clientes")
@@ -134,7 +246,7 @@ elif menu == "👥 Clientes":
                     col1, col2, col3 = st.columns([2,2,1])
                     col1.metric("Prioridad", f"{c.get('prioridad', 5)}/10")
                     col2.metric("Penalización", f"{c.get('penalizacion', 0)} €/día")
-                    if col3.button("🗑️ Eliminar", key=f"del_cli_{c.get('id')}"):
+                    if col3.button("🗑️", key=f"del_cli_{c.get('id')}"):
                         if delete_data("clientes", "id", c.get('id')):
                             st.rerun()
         else:
@@ -146,7 +258,6 @@ elif menu == "👥 Clientes":
             col1, col2 = st.columns(2)
             with col1:
                 prioridad = st.slider("Prioridad (1-10)", 1, 10, 5)
-                st.caption("10 = máxima prioridad")
             with col2:
                 penalizacion = st.number_input("Penalización (€/día retraso)", min_value=0, value=0)
             
@@ -158,11 +269,9 @@ elif menu == "👥 Clientes":
                         "penalizacion": penalizacion
                     })
                     st.rerun()
-                else:
-                    st.error("El nombre es obligatorio")
 
 # ============================================
-# PRODUCTOS (CRUD completo)
+# PRODUCTOS (CRUD)
 # ============================================
 elif menu == "📦 Productos":
     st.header("📦 Gestión de Productos")
@@ -178,7 +287,7 @@ elif menu == "📦 Productos":
                     col1.metric("SKU", p.get('sku', 'N/A'))
                     col2.metric("Formato", p.get('formato', 'N/A'))
                     col3.metric("Familia", p.get('familia', '-'))
-                    if col4.button("🗑️ Eliminar", key=f"del_prod_{p.get('sku')}"):
+                    if col4.button("🗑️", key=f"del_prod_{p.get('sku')}"):
                         if delete_data("productos", "sku", p.get('sku')):
                             st.rerun()
         else:
@@ -203,11 +312,9 @@ elif menu == "📦 Productos":
                         "familia": familia
                     })
                     st.rerun()
-                else:
-                    st.error("SKU y nombre son obligatorios")
 
 # ============================================
-# PEDIDOS (CRUD completo)
+# PEDIDOS (CRUD)
 # ============================================
 elif menu == "📝 Pedidos":
     st.header("📝 Gestión de Pedidos")
@@ -248,7 +355,7 @@ elif menu == "📝 Pedidos":
                     cliente_opciones = {c.get('nombre'): c.get('id') for c in clientes}
                     cliente_nombre = st.selectbox("Cliente", list(cliente_opciones.keys()))
                 with col2:
-                    fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
+                    fecha_entrega = st.date_input("Fecha de entrega requerida", datetime.now())
                     producto_opciones = {p.get('sku'): p.get('nombre') for p in productos}
                     producto_sku = st.selectbox("Producto", list(producto_opciones.keys()))
                     cantidad = st.number_input("Cantidad (latas)", min_value=1, value=10000, step=1000)
@@ -269,25 +376,42 @@ elif menu == "📝 Pedidos":
                         st.error("El número de pedido es obligatorio")
 
 # ============================================
-# PLANIFICACIÓN
+# PLANIFICACIÓN CON DEEPSEEK IA
 # ============================================
-elif menu == "🏭 Planificación":
-    st.header("🏭 Planificación de Producción")
+elif menu == "🤖 IA DeepSeek - Planificar":
+    st.header("🤖 Planificación con DeepSeek IA (Gratuita)")
     
-    st.info("🚧 En desarrollo... Próximamente: algoritmo de asignación de pedidos a máquinas")
-    
-    # Aquí implementaremos el algoritmo de planificación
     maquinas = get_data("maquinas")
     pedidos = get_data("pedidos")
+    clientes = get_data("clientes")
+    productos = get_data("productos")
     
-    if maquinas and pedidos:
-        st.subheader("📊 Resumen para planificación")
-        st.write(f"**Máquinas disponibles:** {len(maquinas)}")
-        st.write(f"**Pedidos pendientes:** {len(pedidos)}")
-        
-        # Mostrar tabla de pedidos pendientes
-        df_pedidos = pd.DataFrame(pedidos)
-        if not df_pedidos.empty:
-            st.dataframe(df_pedidos[['numero', 'cantidad', 'fecha_entrega', 'producto_sku']], use_container_width=True)
+    # Mostrar resumen de datos
+    col1, col2 = st.columns(2)
+    with col1:
+        st.info(f"🏭 Máquinas: {len(maquinas)}")
+        st.info(f"👥 Clientes: {len(clientes)}")
+    with col2:
+        st.info(f"📦 Productos: {len(productos)}")
+        st.info(f"📝 Pedidos: {len(pedidos)}")
+    
+    if not maquinas:
+        st.error("❌ No hay máquinas registradas. Ve a 'Máquinas' para añadir.")
+    elif not pedidos:
+        st.warning("⚠️ No hay pedidos para planificar. Crea algunos pedidos primero.")
     else:
-        st.warning("Faltan máquinas o pedidos para iniciar la planificación")
+        # Verificar API Key
+        api_key = None
+        if "DEEPSEEK_API_KEY" in st.secrets:
+            api_key = st.secrets["DEEPSEEK_API_KEY"]
+        elif "manual_deepseek_key" in st.session_state:
+            api_key = st.session_state.manual_deepseek_key
+        
+        if not api_key:
+            st.error("❌ No hay API Key de DeepSeek configurada")
+            st.info("""
+            **Cómo configurar la API Key:**
+            
+            1. Ve a [DeepSeek Platform](https://platform.deepseek.com/)
+            2. Regístrate y crea una API Key
+            3. En Streamlit Cloud: Settings → Secrets → Añade:
