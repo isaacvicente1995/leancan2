@@ -30,99 +30,27 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def supabase_get(table, filters=None):
-    url = f"{SUPABASE_URL}/{table}"
-    if filters:
-        url += f"?{filters}"
+def supabase_get(table):
     try:
-        resp = requests.get(url, headers=HEADERS)
-        return resp.json() if resp.status_code == 200 else []
+        response = requests.get(f"{SUPABASE_URL}/{table}", headers=HEADERS)
+        if response.status_code == 200:
+            return response.json()
+        return []
     except:
         return []
 
 def supabase_post(table, data):
     try:
-        resp = requests.post(f"{SUPABASE_URL}/{table}", headers=HEADERS, json=data)
-        return resp.status_code in [200, 201]
-    except:
-        return False
-
-def supabase_delete(table, id_field, id_value):
-    try:
-        resp = requests.delete(f"{SUPABASE_URL}/{table}?{id_field}=eq.{id_value}", headers=HEADERS)
-        return resp.status_code == 204
+        response = requests.post(f"{SUPABASE_URL}/{table}", headers=HEADERS, json=data)
+        return response.status_code in [200, 201]
     except:
         return False
 
 # ============================================
-# FUNCIONES DE PLANIFICACIÓN INTELIGENTE
+# FUNCIONES
 # ============================================
-def obtener_compatibilidad(formato, lleva_rt):
-    """Devuelve las máquinas compatibles con un producto"""
-    if lleva_rt:
-        return ['E5']
-    
-    compatibilidad = {
-        'RR-120': ['E1', 'E2', 'E3'],
-        'RR-90': ['E2'],
-        'RO-85': ['E8'],
-        'RT': ['E5']
-    }
-    return compatibilidad.get(formato, ['E2'])
-
-def distribucion_inteligente(lineas_pedido):
-    """
-    Distribuye los productos entre máquinas de forma eficiente
-    """
-    capacidades = {'E1': 54000, 'E2': 32400, 'E3': 54000, 'E5': 33750, 'E8': 48600}
-    carga_actual = {'E1': 0, 'E2': 0, 'E3': 0, 'E5': 0, 'E8': 0}
-    asignaciones = []
-    
-    # Ordenar líneas por cantidad (mayor primero) y priorizar RT
-    lineas_ordenadas = sorted(lineas_pedido, key=lambda x: (-x.get('cantidad', 0), -x.get('lleva_rt', False)))
-    
-    for linea in lineas_ordenadas:
-        cantidad = linea['cantidad']
-        lleva_rt = linea.get('lleva_rt', False)
-        formato = linea.get('formato', 'RR-120')
-        
-        # Obtener máquinas compatibles
-        maquinas_posibles = obtener_compatibilidad(formato, lleva_rt)
-        
-        # Ordenar máquinas por carga actual (menos cargada primero)
-        maquinas_ordenadas = sorted(maquinas_posibles, key=lambda m: carga_actual[m])
-        
-        cantidad_restante = cantidad
-        
-        for maquina in maquinas_ordenadas:
-            if cantidad_restante <= 0:
-                break
-            
-            disponible = capacidades[maquina] - carga_actual[maquina]
-            if disponible <= 0:
-                continue
-            
-            asignar = min(cantidad_restante, disponible)
-            if asignar > 0:
-                asignaciones.append({
-                    'linea_id': linea.get('id'),
-                    'sku': linea['sku'],
-                    'nombre': linea.get('nombre', ''),
-                    'maquina': maquina,
-                    'cantidad': asignar,
-                    'lleva_rt': lleva_rt
-                })
-                carga_actual[maquina] += asignar
-                cantidad_restante -= asignar
-        
-        # Si no se pudo asignar toda la cantidad, mostrar advertencia
-        if cantidad_restante > 0:
-            st.warning(f"⚠️ No hay capacidad suficiente para {linea['sku']}: faltan {cantidad_restante} latas")
-    
-    return asignaciones, carga_actual, capacidades
-
 def extraer_lineas(texto):
-    """Extrae líneas del pedido desde texto"""
+    """Extrae productos del pedido"""
     lineas = []
     patron_sku = r'\b(\d{13}|\d{10})\b'
     patron_cantidad = r'\b(\d{1,3}(?:\.\d{3})*|\d{4,})\b'
@@ -149,10 +77,45 @@ def extraer_lineas(texto):
                 'sku': sku_match.group(1),
                 'nombre': nombre,
                 'cantidad': cantidad,
-                'lleva_rt': lleva_rt,
-                'formato': 'RR-120'  # Por defecto, se puede mejorar
+                'lleva_rt': lleva_rt
             })
     return lineas
+
+def asignar_maquinas(lineas_pedido):
+    """Asigna cada producto a la máquina adecuada"""
+    capacidades = {'E1': 54000, 'E2': 32400, 'E3': 54000, 'E5': 33750, 'E8': 48600}
+    carga = {'E1': 0, 'E2': 0, 'E3': 0, 'E5': 0, 'E8': 0}
+    asignaciones = []
+    
+    for linea in lineas_pedido:
+        cantidad = linea['cantidad']
+        lleva_rt = linea.get('lleva_rt', False)
+        
+        if lleva_rt:
+            maquina = 'E5'
+            asignaciones.append({
+                'sku': linea['sku'],
+                'nombre': linea['nombre'],
+                'cantidad': cantidad,
+                'maquina': maquina,
+                'lleva_rt': lleva_rt
+            })
+            carga[maquina] += cantidad
+        else:
+            # Distribuir entre E1, E2, E3 según carga actual
+            opciones = ['E1', 'E2', 'E3']
+            opciones_ordenadas = sorted(opciones, key=lambda m: carga[m])
+            maquina = opciones_ordenadas[0]
+            asignaciones.append({
+                'sku': linea['sku'],
+                'nombre': linea['nombre'],
+                'cantidad': cantidad,
+                'maquina': maquina,
+                'lleva_rt': lleva_rt
+            })
+            carga[maquina] += cantidad
+    
+    return asignaciones, carga, capacidades
 
 # ============================================
 # CARGA DE DATOS
@@ -161,8 +124,11 @@ with st.spinner("🔄 Cargando datos..."):
     clientes = supabase_get("clientes")
     pedidos = supabase_get("pedidos")
     lineas_pedido = supabase_get("lineas_pedido")
+    asignaciones_db = supabase_get("asignaciones")
 
-# Menú
+# ============================================
+# MENÚ
+# ============================================
 st.sidebar.markdown("<h2 style='text-align: center;'>🏭 LeanCan</h2>", unsafe_allow_html=True)
 menu = st.sidebar.radio("", ["📊 PANEL", "🏭 MÁQUINAS", "📅 PLANIFICACIÓN", "📦 PEDIDOS", "📄 IMPORTAR"])
 
@@ -173,13 +139,9 @@ if menu == "📊 PANEL":
     st.markdown("<h1>Panel de Control</h1>", unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns(3)
-    total_pedidos = len(pedidos)
-    total_lineas = len(lineas_pedido)
-    total_latas = sum(l.get('cantidad', 0) for l in lineas_pedido)
-    
-    col1.metric("📦 Pedidos", total_pedidos)
-    col2.metric("📋 Líneas", total_lineas)
-    col3.metric("🥫 Latas", f"{total_latas:,}")
+    col1.metric("📦 Pedidos", len(pedidos))
+    col2.metric("📋 Productos", len(lineas_pedido))
+    col3.metric("🥫 Latas", sum(l.get('cantidad', 0) for l in lineas_pedido))
     
     if pedidos:
         st.subheader("Últimos pedidos")
@@ -192,64 +154,60 @@ elif menu == "🏭 MÁQUINAS":
     st.markdown("<h1>Líneas de Producción</h1>", unsafe_allow_html=True)
     
     maquinas_info = {
-        'E1': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000, 'color': '#1f77b4'},
-        'E2': {'formato': 'RR-120/RR-90', 'velocidad': 120, 'capacidad': 32400, 'color': '#ff7f0e'},
-        'E3': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000, 'color': '#2ca02c'},
-        'E5': {'formato': 'RT', 'velocidad': 125, 'capacidad': 33750, 'color': '#d62728'},
-        'E8': {'formato': 'RO-85', 'velocidad': 180, 'capacidad': 48600, 'color': '#9467bd'}
+        'E1': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000},
+        'E2': {'formato': 'RR-120/RR-90', 'velocidad': 120, 'capacidad': 32400},
+        'E3': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000},
+        'E5': {'formato': 'RT (Retráctil)', 'velocidad': 125, 'capacidad': 33750},
+        'E8': {'formato': 'RO-85', 'velocidad': 180, 'capacidad': 48600}
     }
     
     for maq, info in maquinas_info.items():
         st.markdown(f"""
         <div class="machine-card">
             <div style="font-size: 20px; font-weight: bold;">{maq}</div>
-            <div>Formato: {info['formato']} | Velocidad: {info['velocidad']} latas/min | Capacidad: {info['capacidad']:,} latas/día</div>
+            <div>📦 Formato: {info['formato']} | ⚡ Velocidad: {info['velocidad']} latas/min | 🏭 Capacidad: {info['capacidad']:,} latas/día</div>
         </div>
         """, unsafe_allow_html=True)
 
 # ============================================
-# PLANIFICACIÓN INTELIGENTE
+# PLANIFICACIÓN
 # ============================================
 elif menu == "📅 PLANIFICACIÓN":
-    st.markdown("<h1>Planificación Inteligente</h1>", unsafe_allow_html=True)
+    st.markdown("<h1>Planificación de Producción</h1>", unsafe_allow_html=True)
     
     if not lineas_pedido:
-        st.warning("⚠️ No hay líneas de pedido para planificar. Importa un pedido primero.")
+        st.warning("⚠️ No hay productos cargados. Importa un pedido primero.")
     else:
-        if st.button("🚀 DISTRIBUIR PRODUCTOS", type="primary", use_container_width=True):
+        if st.button("🚀 GENERAR PLANIFICACIÓN", type="primary", use_container_width=True):
             with st.spinner("Distribuyendo productos entre máquinas..."):
-                asignaciones, cargas, capacidades = distribucion_inteligente(lineas_pedido)
+                asignaciones, cargas, capacidades = asignar_maquinas(lineas_pedido)
             
-            st.success(f"✅ {len(asignaciones)} asignaciones generadas")
+            st.success(f"✅ {len(asignaciones)} productos asignados")
             
-            # Resumen por máquina
+            # Gráfico de carga
             st.subheader("📊 Carga por Máquina")
-            
             df_carga = pd.DataFrame([
-                {"Máquina": m, "Carga (latas)": cargas[m], "Capacidad": capacidades[m], "%": round(cargas[m]/capacidades[m]*100, 1)}
+                {"Máquina": m, "Latas": cargas[m], "Capacidad": capacidades[m], "%": round(cargas[m]/capacidades[m]*100, 1)}
                 for m in cargas
             ])
-            
             fig = px.bar(df_carga, x="Máquina", y="%", text="%", color="%", color_continuous_scale=["green","yellow","red"])
             fig.update_traces(textposition='outside')
             st.plotly_chart(fig, use_container_width=True)
             
-            # Asignaciones detalladas
-            st.subheader("📋 Asignaciones por Máquina")
-            
+            # Tabla de asignaciones
+            st.subheader("📋 Asignación por Máquina")
             for maquina in ['E1', 'E2', 'E3', 'E5', 'E8']:
-                asig_maquina = [a for a in asignaciones if a['maquina'] == maquina]
-                if asig_maquina:
+                asig = [a for a in asignaciones if a['maquina'] == maquina]
+                if asig:
                     with st.expander(f"🖥️ {maquina} - {cargas[maquina]:,} / {capacidades[maquina]:,} latas ({round(cargas[maquina]/capacidades[maquina]*100,1)}%)"):
-                        for a in asig_maquina:
+                        for a in asig:
                             rt = " (con RT)" if a['lleva_rt'] else ""
-                            st.write(f"📦 {a['sku']}: {a['cantidad']:,} latas{rt}")
+                            st.write(f"📦 {a['sku']} - {a['nombre'][:40]}: {a['cantidad']:,} latas{rt}")
             
-            # Guardar asignaciones en base de datos
+            # Guardar asignaciones
             if st.button("💾 GUARDAR PLANIFICACIÓN"):
                 for a in asignaciones:
                     supabase_post("asignaciones", {
-                        "linea_pedido_id": a.get('linea_id', 0),
                         "maquina": a['maquina'],
                         "cantidad_asignada": a['cantidad'],
                         "fecha_programada": str(datetime.now().date())
@@ -263,20 +221,16 @@ elif menu == "📦 PEDIDOS":
     st.markdown("<h1>Pedidos</h1>", unsafe_allow_html=True)
     
     if pedidos:
-        for pedido in pedidos:
-            with st.expander(f"📄 {pedido.get('numero', 'N/A')}"):
-                st.write(f"Cliente: {pedido.get('cliente_id', 'N/A')}")
-                st.write(f"Fecha entrega: {pedido.get('fecha_entrega', 'N/A')}")
-                
-                # Mostrar líneas de este pedido
-                lineas = [l for l in lineas_pedido if l.get('pedido_id') == pedido.get('id')]
-                if lineas:
-                    st.write("**Productos:**")
-                    for l in lineas:
-                        rt = " (RT)" if l.get('lleva_rt') else ""
-                        st.write(f"  - {l.get('sku')}: {l.get('cantidad'):,} latas{rt}")
+        df_ped = pd.DataFrame(pedidos)
+        st.dataframe(df_ped[['numero', 'cliente_id', 'fecha_entrega', 'estado']], use_container_width=True)
+        
+        # Mostrar líneas de cada pedido
+        if lineas_pedido:
+            st.subheader("📋 Productos por Pedido")
+            df_lineas = pd.DataFrame(lineas_pedido)
+            st.dataframe(df_lineas[['pedido_id', 'sku', 'nombre', 'cantidad', 'lleva_rt']], use_container_width=True)
     else:
-        st.info("No hay pedidos")
+        st.info("No hay pedidos registrados")
 
 # ============================================
 # IMPORTAR PEDIDO
@@ -288,30 +242,31 @@ elif menu == "📄 IMPORTAR":
         st.code("""
 1000895661880 RR-120 LULAS DE CALDEIRADA S/E 56.000 1 56.000
 1000895561883 RR-120 LULAS RECHEADAS CALDEIRADA S/E 35.532 1 35.532
+1000898461845 RR-120 POTA GIGANTE EM CALDEIRADA S/E 23.688 1 23.688
+1000898461203 RR-120 POTA GIGANTE C/ALHOS/E 5.922 1 5.922
 5603344651041 RR-120 LULAS DE CALDEIRADA RT10 GENERAL 220 100 22.000
+5603344651058 RR-120 LULAS RECHEADAS EM CALDEIRADA RT10 GENERAL 176 100 17.600
+5603344641035 RR-120 POTA GIGANTE EM CALDEIRADA RT10 GENERAL 44 100 4.400
+5603344651065 RR-120 CHOQUINHOS RECHEADOS COM TINTA RT10 GENERAL 88 100 8.800
         """)
     
-    texto_pedido = st.text_area("📝 Texto del pedido:", height=200)
+    texto_pedido = st.text_area("📝 Pega aquí el texto del pedido completo:", height=200)
     
     col1, col2 = st.columns(2)
     with col1:
-        pedido_numero = st.text_input("Número de pedido", "PEDIDO_" + datetime.now().strftime("%Y%m%d%H%M%S"))
+        pedido_numero = st.text_input("Número de pedido", "PED_" + datetime.now().strftime("%Y%m%d%H%M%S"))
         fecha_entrega = st.date_input("Fecha de entrega", datetime.now() + timedelta(days=7))
     with col2:
         opciones = [c['nombre'] for c in clientes] if clientes else ["CLIENTE_TEST"]
         cliente = st.selectbox("Cliente", opciones)
     
-    if st.button("🔍 PROCESAR Y GUARDAR", type="primary", use_container_width=True):
+    if st.button("📥 IMPORTAR PEDIDO", type="primary", use_container_width=True):
         if texto_pedido:
-            with st.spinner("Procesando pedido..."):
+            with st.spinner("Procesando..."):
                 lineas = extraer_lineas(texto_pedido)
             
             if lineas:
                 st.success(f"✅ {len(lineas)} productos extraídos")
-                
-                # Mostrar productos
-                df_lineas = pd.DataFrame(lineas)
-                st.dataframe(df_lineas, use_container_width=True)
                 
                 # Obtener cliente_id
                 cliente_id = None
@@ -321,9 +276,9 @@ elif menu == "📄 IMPORTAR":
                         break
                 
                 if cliente_id is None:
-                    st.error("Cliente no encontrado")
+                    st.error("❌ Cliente no encontrado. Ve a Supabase y añade el cliente.")
                 else:
-                    # 1. Guardar cabecera del pedido
+                    # Guardar cabecera del pedido
                     pedido_data = {
                         "numero": pedido_numero,
                         "cliente_id": cliente_id,
@@ -333,26 +288,34 @@ elif menu == "📄 IMPORTAR":
                     
                     if supabase_post("pedidos", pedido_data):
                         # Obtener el ID del pedido recién creado
-                        pedidos_nuevos = supabase_get("pedidos", f"numero=eq.{pedido_numero}")
-                        if pedidos_nuevos:
-                            pedido_id = pedidos_nuevos[0]['id']
-                            
-                            # 2. Guardar cada línea de pedido
+                        pedidos_actualizados = supabase_get("pedidos")
+                        pedido_id = None
+                        for p in pedidos_actualizados:
+                            if p['numero'] == pedido_numero:
+                                pedido_id = p['id']
+                                break
+                        
+                        if pedido_id:
+                            # Guardar cada línea
                             for item in lineas:
-                                supabase_post("lineas_pedido", {
+                                linea_data = {
                                     "pedido_id": pedido_id,
                                     "sku": item['sku'],
                                     "nombre": item['nombre'],
                                     "cantidad": item['cantidad'],
-                                    "lleva_rt": item['lleva_rt'],
-                                    "formato": "RR-120"
-                                })
+                                    "lleva_rt": 1 if item['lleva_rt'] else 0
+                                }
+                                supabase_post("lineas_pedido", linea_data)
                             
                             st.success(f"✅ Pedido {pedido_numero} guardado con {len(lineas)} productos")
                             st.balloons()
                             time.sleep(1)
                             st.rerun()
+                        else:
+                            st.error("No se pudo obtener el ID del pedido")
                     else:
                         st.error("Error al guardar el pedido")
             else:
                 st.error("No se encontraron productos")
+        else:
+            st.warning("Pega el texto del pedido")
