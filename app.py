@@ -4,14 +4,18 @@ import pandas as pd
 from datetime import datetime
 import json
 import re
-import base64
+import tempfile
+import os
 from openai import OpenAI
+import PyPDF2
 
 st.set_page_config(page_title="LeanCan", page_icon="🥫", layout="wide")
 
 st.title("🥫 LeanCan Scheduler")
 
-# Configuración Supabase
+# ============================================
+# CONFIGURACIÓN SUPABASE
+# ============================================
 SUPABASE_URL = "https://nubxhtlertuwmevxzuyd.supabase.co/rest/v1"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im51YnhodGxlcnR1d21ldnh6dXlkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDMxMjg4NiwiZXhwIjoyMDk1ODg4ODg2fQ.pFNHfgUB7Nxz5i3ZDBQtwbC95wvxjs77SwmE_5ROZzw"
 
@@ -38,62 +42,66 @@ def insert_data(table, data):
         return False
 
 # ============================================
-# IA QUE LEE PDF (CON VISIÓN)
+# FUNCIONES PARA LEER PDF
 # ============================================
-def leer_pdf_con_ia(archivo_pdf):
-    """
-    Usa OpenRouter con modelo de visión para leer el PDF
-    y extraer todas las líneas del pedido
-    """
+def extraer_texto_pdf(archivo_pdf):
+    """Extrae texto de un PDF usando PyPDF2"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(archivo_pdf.getvalue())
+            tmp_path = tmp_file.name
+        
+        texto_completo = ""
+        with open(tmp_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    texto_completo += page_text + "\n"
+        
+        os.unlink(tmp_path)
+        return texto_completo if texto_completo.strip() else None
+    except Exception as e:
+        st.error(f"Error al leer PDF: {e}")
+        return None
+
+# ============================================
+# IA CON OPENROUTER (MODELO DE TEXTO)
+# ============================================
+def extraer_con_ia(texto_pedido):
+    """Usa OpenRouter con modelo de texto para extraer líneas de pedido"""
     if "OPENROUTER_API_KEY" not in st.secrets:
-        st.error("❌ No se encontró OPENROUTER_API_KEY en Secrets")
+        st.warning("⚠️ No se encontró OPENROUTER_API_KEY. Usando método sin IA.")
         return None
 
     try:
-        # Convertir PDF a base64
-        pdf_base64 = base64.b64encode(archivo_pdf.getvalue()).decode('utf-8')
-        
         client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=st.secrets["OPENROUTER_API_KEY"],
         )
         
-        prompt = """Eres un extractor de pedidos de conservas. Analiza este PDF y extrae TODAS las líneas de pedido.
+        prompt = f"""Extrae todas las líneas de pedido del siguiente texto de un pedido de conservas.
 
-Para cada línea, extrae:
-1. SKU (si aparece, como 566188, 556188, etc. Si no aparece, usa el nombre del producto)
-2. Nombre del producto
-3. Cantidad de latas (número)
-4. Si lleva RT (buscando "RT10", "retractil", o si el código de embalaje es GENERAL)
+Busca para cada línea:
+- SKU: códigos de 6-10 dígitos (ej: 566188, 556188, 3344651041)
+- Cantidad: números grandes como 56.000, 35.532, 22.000
+- Si lleva RT: si aparece "RT10" o "retractil"
 
-Devuelve SOLO un JSON con este formato exacto:
-{
-    "lineas": [
-        {"sku": "566188", "nombre": "LULAS DE CALDEIRADA", "cantidad": 56000, "lleva_rt": false},
-        {"sku": "3344651041", "nombre": "LULAS DE CALDEIRADA RT", "cantidad": 22000, "lleva_rt": true}
-    ],
-    "total_latas": 173942,
-    "cliente": "RAMIREZ Y CIA"
-}
+Texto:
+{texto_pedido[:4000]}
 
-NO añadas texto adicional fuera del JSON."""
+Devuelve SOLO un JSON válido con este formato:
+{{"lineas": [
+    {{"sku": "566188", "nombre": "LULAS DE CALDEIRADA", "cantidad": 56000, "lleva_rt": false}},
+    {{"sku": "3344651041", "nombre": "LULAS DE CALDEIRADA RT", "cantidad": 22000, "lleva_rt": true}}
+]}}
+"""
         
-        # Usar modelo con visión (Gemini o Llama Vision)
         response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-exp:free",  # Modelo gratuito con visión
+            model="deepseek/deepseek-chat:free",
             messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:application/pdf;base64,{pdf_base64}"
-                            }
-                        }
-                    ]
-                }
+                {"role": "system", "content": "Eres un extractor de pedidos. Responde SOLO con JSON válido. No añadas texto fuera del JSON."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.1,
             extra_headers={
@@ -111,36 +119,44 @@ NO añadas texto adicional fuera del JSON."""
         return json.loads(respuesta.strip())
         
     except Exception as e:
-        st.error(f"Error con IA Visión: {e}")
+        st.error(f"Error con IA: {e}")
         return None
 
 # ============================================
-# MÉTODO ALTERNATIVO (SIN IA)
+# MÉTODO SIN IA (REGEX)
 # ============================================
-def extraer_lineas_regex(texto):
-    """Extrae líneas usando regex (respaldo cuando la IA falla)"""
+def extraer_con_regex(texto):
+    """Extrae líneas usando regex (sin IA, funciona siempre)"""
     lineas = []
     for linea in texto.split('\n'):
         sku_match = re.search(r'\b(\d{6,10})\b', linea)
         cant_match = re.findall(r'\b(\d{1,3}(?:\.\d{3})*|\d{4,})\b', linea)
+        
         cantidad = 0
         for c in cant_match:
             num = int(c.replace('.', ''))
             if 1000 < num < 1000000:
                 cantidad = num
                 break
-        lleva_rt = 'RT10' in linea or 'RT' in linea.upper()
+        
+        lleva_rt = 'RT10' in linea or 'RT' in linea.upper() or 'retractil' in linea.lower()
+        
         if sku_match and cantidad > 0:
+            # Limpiar nombre
+            nombre = linea.replace(sku_match.group(1), '').strip()
+            if len(nombre) > 50:
+                nombre = nombre[:50]
+            
             lineas.append({
                 'sku': sku_match.group(1),
-                'nombre': linea[:50],
+                'nombre': nombre,
                 'cantidad': cantidad,
                 'lleva_rt': lleva_rt
             })
     return lineas
 
 # ============================================
-# CARGAR DATOS
+# CARGAR DATOS INICIALES
 # ============================================
 with st.spinner("Cargando datos..."):
     maquinas_data = get_data("maquinas")
@@ -149,15 +165,15 @@ with st.spinner("Cargando datos..."):
     pedidos_data = get_data("pedidos")
 
 # ============================================
-# MENÚ
+# MENÚ PRINCIPAL
 # ============================================
 menu = st.sidebar.radio(
     "MENU",
-    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 IA lee PDF", "🤖 Planificar"]
+    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 Cargar Pedido", "🤖 IA Planificar"]
 )
 
 # ============================================
-# DASHBOARD (simplificado)
+# DASHBOARD
 # ============================================
 if menu == "📊 Dashboard":
     st.header("📊 Dashboard")
@@ -166,17 +182,21 @@ if menu == "📊 Dashboard":
     col2.metric("👥 Clientes", len(clientes_data))
     col3.metric("📦 Productos", len(productos_data))
     col4.metric("📝 Pedidos", len(pedidos_data))
+    
+    if pedidos_data:
+        st.subheader("Últimos pedidos")
+        st.dataframe(pd.DataFrame(pedidos_data[-5:]), use_container_width=True)
 
 # ============================================
-# MÁQUINAS
+# MÁQUINAS (SIMPLIFICADO)
 # ============================================
 elif menu == "⚙️ Máquinas":
     st.header("⚙️ Máquinas")
     for m in maquinas_data:
-        st.write(f"🖥️ {m.get('nombre')}: {m.get('velocidad')} latas/min")
+        st.write(f"🖥️ {m.get('nombre')}: {m.get('velocidad')} latas/min, Cap: {m.get('capacidad'):,} latas/día")
 
 # ============================================
-# CLIENTES
+# CLIENTES (SIMPLIFICADO)
 # ============================================
 elif menu == "👥 Clientes":
     st.header("👥 Clientes")
@@ -184,7 +204,7 @@ elif menu == "👥 Clientes":
         st.write(f"🏢 {c.get('nombre')}: Prioridad {c.get('prioridad')}/10")
 
 # ============================================
-# PRODUCTOS
+# PRODUCTOS (SIMPLIFICADO)
 # ============================================
 elif menu == "📦 Productos":
     st.header("📦 Productos")
@@ -192,60 +212,92 @@ elif menu == "📦 Productos":
         st.write(f"📦 {p.get('sku')}: {p.get('nombre')}")
 
 # ============================================
-# PEDIDOS
+# PEDIDOS (SIMPLIFICADO)
 # ============================================
 elif menu == "📝 Pedidos":
     st.header("📝 Pedidos")
     for p in pedidos_data:
-        st.write(f"📄 {p.get('numero')}: {p.get('cantidad')} latas")
+        st.write(f"📄 {p.get('numero')}: {p.get('cantidad')} latas | RT: {'✅' if p.get('lleva_rt') else '❌'}")
 
 # ============================================
-# IA LEE PDF (NUEVO - CON VISIÓN)
+# CARGAR PEDIDO (PDF + TEXTO + IA)
 # ============================================
-elif menu == "📄 IA lee PDF":
-    st.header("🤖 IA que lee el PDF automáticamente")
+elif menu == "📄 Cargar Pedido":
+    st.header("📄 Cargar Pedido")
     
     st.info("""
-    **Cómo funciona:**
-    1. Sube el PDF del pedido
-    2. La IA lo lee (aunque sea una imagen escaneada)
-    3. Extrae todas las líneas automáticamente
-    4. Guarda el pedido en la base de datos
-    
-    *Usa modelo Gemini 2.0 Flash (gratuito, con visión)*
+    **Dos formas de cargar el pedido:**
+    1. 📎 **Subir PDF** - La aplicación leerá el PDF y extraerá el texto
+    2. 📝 **Pegar texto** - Si prefieres copiar y pegar manualmente
     """)
     
-    archivo_pdf = st.file_uploader("📎 Selecciona el PDF del pedido", type=['pdf'])
+    # Opción 1: Subir PDF
+    st.subheader("📎 Opción 1: Subir archivo PDF")
+    archivo_pdf = st.file_uploader("Selecciona el PDF del pedido", type=['pdf'])
+    
+    texto_extraido = None
     
     if archivo_pdf:
-        st.success(f"✅ Archivo cargado: {archivo_pdf.name} ({archivo_pdf.size/1024:.1f} KB)")
+        with st.spinner("Leyendo PDF..."):
+            texto_extraido = extraer_texto_pdf(archivo_pdf)
         
-        if st.button("🧠 Que la IA lea el PDF", type="primary"):
-            with st.spinner("🔍 IA leyendo el PDF... (puede tomar 10-20 segundos)"):
-                resultado = leer_pdf_con_ia(archivo_pdf)
+        if texto_extraido:
+            st.success(f"✅ PDF leído correctamente ({len(texto_extraido)} caracteres)")
+            with st.expander("Ver texto extraído del PDF (primeros 500 caracteres)"):
+                st.text(texto_extraido[:500])
+        else:
+            st.error("❌ No se pudo extraer texto del PDF. Puede ser una imagen escaneada. Prueba con la opción de pegar texto.")
+    
+    # Opción 2: Pegar texto
+    st.subheader("📝 Opción 2: Pegar texto manualmente")
+    texto_manual = st.text_area("Pega aquí el texto del pedido:", height=150)
+    
+    # Decidir qué texto usar
+    texto_final = texto_extraido if texto_extraido else texto_manual
+    
+    if texto_final:
+        st.subheader("🔧 Procesar pedido")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            usar_ia = st.checkbox("Usar IA (OpenRouter)", value=False, 
+                                  help="Más preciso pero consume crédito. Desactiva para usar método rápido sin IA")
+        with col2:
+            if usar_ia and "OPENROUTER_API_KEY" not in st.secrets:
+                st.warning("⚠️ Sin API key. Añade OPENROUTER_API_KEY a Secrets para usar IA")
+        
+        if st.button("📊 Procesar Pedido", type="primary"):
+            with st.spinner("Procesando..." if not usar_ia else "🧠 IA analizando..."):
+                if usar_ia and "OPENROUTER_API_KEY" in st.secrets:
+                    resultado = extraer_con_ia(texto_final)
+                    if resultado and 'lineas' in resultado:
+                        lineas = resultado['lineas']
+                    else:
+                        st.warning("La IA no respondió correctamente. Usando método alternativo...")
+                        lineas = extraer_con_regex(texto_final)
+                else:
+                    lineas = extraer_con_regex(texto_final)
             
-            if resultado and 'lineas' in resultado:
-                st.balloons()
-                st.success(f"✅ IA extrajo {len(resultado['lineas'])} líneas")
+            if lineas:
+                st.success(f"✅ Se encontraron {len(lineas)} líneas")
                 
-                # Mostrar líneas
-                df_lineas = pd.DataFrame(resultado['lineas'])
+                df_lineas = pd.DataFrame(lineas)
                 st.dataframe(df_lineas, use_container_width=True)
                 
-                total = resultado.get('total_latas', sum(l['cantidad'] for l in resultado['lineas']))
-                st.metric("📦 Total latas", f"{total:,}")
+                total_rt = sum(l['cantidad'] for l in lineas if l.get('lleva_rt', False))
+                total_normal = sum(l['cantidad'] for l in lineas if not l.get('lleva_rt', False))
                 
-                if 'cliente' in resultado:
-                    st.info(f"🏢 Cliente detectado: {resultado['cliente']}")
+                col1, col2 = st.columns(2)
+                col1.metric("📦 Sin RT (E1/E3)", f"{total_normal:,} latas")
+                col2.metric("📦 Con RT (E5)", f"{total_rt:,} latas")
                 
-                # Datos del pedido
-                st.subheader("📝 Datos del pedido")
+                st.subheader("Datos del pedido")
                 col1, col2 = st.columns(2)
                 with col1:
-                    pedido_numero = st.text_input("Número de pedido", "IA_PEDIDO_001")
+                    pedido_numero = st.text_input("Número de pedido", "RAF2026/206")
                     fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
                 with col2:
-                    opciones = [c['nombre'] for c in clientes_data] if clientes_data else [resultado.get('cliente', 'CLIENTE')]
+                    opciones = [c['nombre'] for c in clientes_data] if clientes_data else ["RAMIREZ Y CIA"]
                     cliente = st.selectbox("Cliente", opciones)
                 
                 if st.button("💾 Guardar Pedido", type="primary"):
@@ -255,24 +307,32 @@ elif menu == "📄 IA lee PDF":
                             cliente_id = c['id']
                             break
                     
-                    for item in resultado['lineas']:
+                    for item in lineas:
                         insert_data("pedidos", {
                             "numero": pedido_numero,
                             "cliente_id": cliente_id,
                             "fecha_entrega": str(fecha_entrega),
                             "cantidad": item['cantidad'],
-                            "producto_sku": item.get('sku', item.get('nombre', 'UNKNOWN')[:20]),
+                            "producto_sku": item['sku'],
                             "lleva_rt": 1 if item.get('lleva_rt', False) else 0
                         })
                     
-                    st.success(f"✅ Pedido guardado con {len(resultado['lineas'])} líneas")
+                    st.success(f"✅ Pedido {pedido_numero} guardado con {len(lineas)} líneas")
                     st.balloons()
             else:
-                st.error("❌ La IA no pudo leer el PDF. ¿El archivo es válido?")
+                st.error("❌ No se encontraron líneas. Verifica el formato del texto.")
 
 # ============================================
-# PLANIFICAR
+# IA PLANIFICAR
 # ============================================
-elif menu == "🤖 Planificar":
+elif menu == "🤖 IA Planificar":
     st.header("🤖 Planificación con IA")
-    st.info("🚧 En desarrollo - Próximamente")
+    st.info("🚧 En desarrollo - Próximamente asignación automática de pedidos a máquinas con IA")
+    
+    if len(maquinas_data) == 0:
+        st.error("❌ No hay máquinas registradas")
+    elif len(pedidos_data) == 0:
+        st.warning("⚠️ No hay pedidos para planificar")
+    else:
+        st.write(f"📊 **Resumen actual:** {len(pedidos_data)} pedidos para {len(maquinas_data)} máquinas")
+        st.dataframe(pd.DataFrame(pedidos_data), use_container_width=True)
