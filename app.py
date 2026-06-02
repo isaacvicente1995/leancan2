@@ -4,13 +4,8 @@ import pandas as pd
 from datetime import datetime
 import json
 import re
-import tempfile
-import os
+import base64
 from openai import OpenAI
-import PyPDF2
-from pdf2image import convert_from_bytes
-import pytesseract
-from PIL import Image
 
 st.set_page_config(page_title="LeanCan", page_icon="🥫", layout="wide")
 
@@ -43,39 +38,91 @@ def insert_data(table, data):
         return False
 
 # ============================================
-# FUNCIÓN PARA LEER PDF CON OCR
+# IA VISIÓN CON OPENROUTER (LEE PDF DIRECTAMENTE)
 # ============================================
-def leer_pdf_con_ocr(archivo_pdf):
-    """Lee un PDF escaneado usando OCR (Tesseract)"""
+def leer_pdf_con_ia_vision(archivo_pdf):
+    """
+    Usa OpenRouter con modelo de visión para leer el PDF directamente
+    """
+    if "OPENROUTER_API_KEY" not in st.secrets:
+        st.error("❌ No se encontró OPENROUTER_API_KEY en Secrets")
+        return None
+
     try:
-        # Convertir PDF a imágenes
-        st.info("🖼️ Convirtiendo PDF a imágenes...")
-        images = convert_from_bytes(archivo_pdf.getvalue(), dpi=200)
+        # Convertir PDF a base64
+        pdf_base64 = base64.b64encode(archivo_pdf.getvalue()).decode('utf-8')
         
-        texto_completo = ""
-        for i, image in enumerate(images):
-            st.info(f"📄 Procesando página {i+1} de {len(images)}...")
-            # Aplicar OCR a la imagen
-            texto_pagina = pytesseract.image_to_string(image, lang='spa+eng')
-            texto_completo += texto_pagina + "\n"
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=st.secrets["OPENROUTER_API_KEY"],
+        )
         
-        return texto_completo if texto_completo.strip() else None
+        prompt = """Analiza este PDF de un pedido de conservas. Extrae TODAS las líneas de pedido.
+
+Para cada línea, busca:
+- SKU: códigos de 6-10 dígitos (ej: 566188, 556188, 3344651041)
+- Cantidad: números como 56.000, 35.532, 22.000
+- Si lleva RT: si aparece "RT10" o "retractil"
+
+Devuelve SOLO un JSON con este formato:
+{
+    "lineas": [
+        {"sku": "566188", "nombre": "LULAS DE CALDEIRADA", "cantidad": 56000, "lleva_rt": false},
+        {"sku": "3344651041", "nombre": "LULAS DE CALDEIRADA RT", "cantidad": 22000, "lleva_rt": true}
+    ],
+    "total_latas": 173942,
+    "cliente_detectado": "RAMIREZ Y CIA"
+}
+
+NO añadas texto adicional fuera del JSON."""
+        
+        # Usar modelo de visión Llama 3.2 (gratuito)
+        response = client.chat.completions.create(
+            model="meta-llama/llama-3.2-11b-vision-instruct:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:application/pdf;base64,{pdf_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+            extra_headers={
+                "HTTP-Referer": "https://leancan2.streamlit.app",
+                "X-Title": "LeanCan Scheduler"
+            }
+        )
+        
+        respuesta = response.choices[0].message.content
+        if "```json" in respuesta:
+            respuesta = respuesta.split("```json")[1].split("```")[0]
+        elif "```" in respuesta:
+            respuesta = respuesta.split("```")[1].split("```")[0]
+        
+        return json.loads(respuesta.strip())
+        
     except Exception as e:
-        st.error(f"Error en OCR: {e}")
+        st.error(f"Error con IA Visión: {e}")
         return None
 
 # ============================================
-# EXTRACCIÓN CON REGEX
+# MÉTODO DE RESPALDO (REGEX)
 # ============================================
 def extraer_con_regex(texto):
-    """Extrae líneas usando regex"""
+    """Extrae líneas usando regex (funciona si el PDF tiene texto)"""
     lineas = []
     for linea in texto.split('\n'):
-        # Buscar SKU (códigos de 6-10 dígitos)
         sku_match = re.search(r'\b(\d{6,10})\b', linea)
-        
-        # Buscar cantidades
         cant_match = re.findall(r'\b(\d{1,3}(?:\.\d{3})*|\d{4,})\b', linea)
+        
         cantidad = 0
         for c in cant_match:
             num = int(c.replace('.', ''))
@@ -95,26 +142,20 @@ def extraer_con_regex(texto):
             })
     return lineas
 
-# ============================================
-# CARGAR DATOS
-# ============================================
+# Cargar datos
 with st.spinner("Cargando datos..."):
     maquinas_data = get_data("maquinas")
     clientes_data = get_data("clientes")
     productos_data = get_data("productos")
     pedidos_data = get_data("pedidos")
 
-# ============================================
-# MENÚ
-# ============================================
+# Menú
 menu = st.sidebar.radio(
     "MENU",
-    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 Cargar Pedido", "🤖 IA Planificar"]
+    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 IA lee PDF"]
 )
 
-# ============================================
-# DASHBOARD
-# ============================================
+# Dashboard
 if menu == "📊 Dashboard":
     st.header("📊 Dashboard")
     col1, col2, col3, col4 = st.columns(4)
@@ -123,130 +164,97 @@ if menu == "📊 Dashboard":
     col3.metric("📦 Productos", len(productos_data))
     col4.metric("📝 Pedidos", len(pedidos_data))
 
-# ============================================
-# MÁQUINAS
-# ============================================
+# Máquinas
 elif menu == "⚙️ Máquinas":
     st.header("⚙️ Máquinas")
     for m in maquinas_data:
         st.write(f"🖥️ {m.get('nombre')}: {m.get('velocidad')} latas/min")
 
-# ============================================
-# CLIENTES
-# ============================================
+# Clientes
 elif menu == "👥 Clientes":
     st.header("👥 Clientes")
     for c in clientes_data:
         st.write(f"🏢 {c.get('nombre')}: Prioridad {c.get('prioridad')}/10")
 
-# ============================================
-# PRODUCTOS
-# ============================================
+# Productos
 elif menu == "📦 Productos":
     st.header("📦 Productos")
     for p in productos_data:
         st.write(f"📦 {p.get('sku')}: {p.get('nombre')}")
 
-# ============================================
-# PEDIDOS
-# ============================================
+# Pedidos
 elif menu == "📝 Pedidos":
     st.header("📝 Pedidos")
     for p in pedidos_data:
         st.write(f"📄 {p.get('numero')}: {p.get('cantidad')} latas")
 
 # ============================================
-# CARGAR PEDIDO CON OCR
+# IA LEE PDF
 # ============================================
-elif menu == "📄 Cargar Pedido":
-    st.header("📄 Cargar Pedido")
+elif menu == "📄 IA lee PDF":
+    st.header("🤖 IA lee el PDF automáticamente")
     
     st.info("""
-    **Sube el PDF del pedido** (aunque sea una imagen escaneada)
-    - El sistema usará OCR para leer el texto automáticamente
-    - Extraerá SKU, cantidades y detectará RT
+    **Cómo funciona:**
+    1. Sube el PDF del pedido
+    2. La IA con visión leerá el PDF (aunque sea imagen escaneada)
+    3. Extraerá automáticamente SKU, cantidades y detectará RT
+    4. Guarda el pedido en la base de datos
+    
+    *Usa modelo Llama 3.2 Vision (gratuito)*
     """)
     
     archivo_pdf = st.file_uploader("📎 Selecciona el PDF del pedido", type=['pdf'])
     
     if archivo_pdf:
-        st.success(f"✅ Archivo cargado: {archivo_pdf.name}")
+        st.success(f"✅ Archivo cargado: {archivo_pdf.name} ({archivo_pdf.size/1024:.1f} KB)")
         
-        # Opciones de procesamiento
-        usar_ocr = st.checkbox("Usar OCR (para PDFs escaneados)", value=True)
-        
-        if st.button("🔍 Procesar Pedido", type="primary"):
-            with st.spinner("Leyendo PDF con OCR... (puede tomar 30-60 segundos)"):
-                if usar_ocr:
-                    texto_extraido = leer_pdf_con_ocr(archivo_pdf)
-                else:
-                    # Intentar extracción normal
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                            tmp.write(archivo_pdf.getvalue())
-                            tmp_path = tmp.name
-                        with open(tmp_path, 'rb') as f:
-                            reader = PyPDF2.PdfReader(f)
-                            texto_extraido = ""
-                            for page in reader.pages:
-                                texto_extraido += page.extract_text()
-                        os.unlink(tmp_path)
-                    except:
-                        texto_extraido = None
+        if st.button("🧠 IA leer PDF", type="primary"):
+            with st.spinner("🔍 IA analizando el PDF... (10-30 segundos)"):
+                resultado = leer_pdf_con_ia_vision(archivo_pdf)
             
-            if texto_extraido:
-                st.success(f"✅ Texto extraído ({len(texto_extraido)} caracteres)")
+            if resultado and 'lineas' in resultado:
+                st.balloons()
+                st.success(f"✅ IA extrajo {len(resultado['lineas'])} líneas")
                 
-                with st.expander("Ver texto extraído (primeros 500 caracteres)"):
-                    st.text(texto_extraido[:500])
+                # Mostrar líneas
+                df_lineas = pd.DataFrame(resultado['lineas'])
+                st.dataframe(df_lineas, use_container_width=True)
                 
-                # Extraer líneas con regex
-                lineas = extraer_con_regex(texto_extraido)
+                total = resultado.get('total_latas', sum(l['cantidad'] for l in resultado['lineas']))
+                st.metric("📦 Total latas", f"{total:,}")
                 
-                if lineas:
-                    st.success(f"✅ Se encontraron {len(lineas)} líneas")
-                    st.dataframe(pd.DataFrame(lineas), use_container_width=True)
+                if 'cliente_detectado' in resultado:
+                    st.info(f"🏢 Cliente detectado: {resultado['cliente_detectado']}")
+                
+                # Datos del pedido
+                st.subheader("📝 Datos del pedido")
+                col1, col2 = st.columns(2)
+                with col1:
+                    pedido_numero = st.text_input("Número de pedido", "IA_PEDIDO_001")
+                    fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
+                with col2:
+                    opciones = [c['nombre'] for c in clientes_data] if clientes_data else [resultado.get('cliente_detectado', 'CLIENTE')]
+                    cliente = st.selectbox("Cliente", opciones)
+                
+                if st.button("💾 Guardar Pedido", type="primary"):
+                    cliente_id = 1
+                    for c in clientes_data:
+                        if c['nombre'] == cliente:
+                            cliente_id = c['id']
+                            break
                     
-                    total = sum(l['cantidad'] for l in lineas)
-                    st.metric("📦 Total latas", f"{total:,}")
+                    for item in resultado['lineas']:
+                        insert_data("pedidos", {
+                            "numero": pedido_numero,
+                            "cliente_id": cliente_id,
+                            "fecha_entrega": str(fecha_entrega),
+                            "cantidad": item['cantidad'],
+                            "producto_sku": item.get('sku', item.get('nombre', 'UNKNOWN')[:20]),
+                            "lleva_rt": 1 if item.get('lleva_rt', False) else 0
+                        })
                     
-                    # Guardar pedido
-                    st.subheader("Datos del pedido")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        pedido_numero = st.text_input("Número de pedido", "OCR_PEDIDO")
-                        fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
-                    with col2:
-                        opciones = [c['nombre'] for c in clientes_data] if clientes_data else ["CLIENTE_TEST"]
-                        cliente = st.selectbox("Cliente", opciones)
-                    
-                    if st.button("💾 Guardar Pedido"):
-                        cliente_id = 1
-                        for c in clientes_data:
-                            if c['nombre'] == cliente:
-                                cliente_id = c['id']
-                                break
-                        
-                        for item in lineas:
-                            insert_data("pedidos", {
-                                "numero": pedido_numero,
-                                "cliente_id": cliente_id,
-                                "fecha_entrega": str(fecha_entrega),
-                                "cantidad": item['cantidad'],
-                                "producto_sku": item['sku'],
-                                "lleva_rt": 1 if item['lleva_rt'] else 0
-                            })
-                        
-                        st.success(f"✅ Pedido guardado con {len(lineas)} líneas")
-                        st.balloons()
-                else:
-                    st.error("❌ No se encontraron líneas. Verifica que el PDF tenga el formato correcto.")
+                    st.success(f"✅ Pedido guardado con {len(resultado['lineas'])} líneas")
+                    st.balloons()
             else:
-                st.error("❌ No se pudo extraer texto. Prueba con la opción de pegar texto manualmente.")
-
-# ============================================
-# IA PLANIFICAR
-# ============================================
-elif menu == "🤖 IA Planificar":
-    st.header("🤖 Planificación con IA")
-    st.info("🚧 En desarrollo - Próximamente")
+                st.error("❌ La IA no pudo leer el PDF. ¿El archivo es válido?")
