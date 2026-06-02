@@ -1,4 +1,3 @@
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -6,6 +5,9 @@ from datetime import datetime
 import json
 from openai import OpenAI
 import re
+import tempfile
+import os
+from PyPDF2 import PdfReader
 
 st.set_page_config(page_title="LeanCan", page_icon="🥫", layout="wide")
 
@@ -37,6 +39,95 @@ def insert_data(table, data):
     except:
         return False
 
+def extraer_texto_pdf(archivo):
+    """Extrae texto de un PDF"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(archivo.getvalue())
+            tmp_path = tmp_file.name
+        
+        reader = PdfReader(tmp_path)
+        texto_completo = ""
+        for page in reader.pages:
+            texto_completo += page.extract_text()
+        
+        os.unlink(tmp_path)
+        return texto_completo
+    except Exception as e:
+        return f"Error al leer PDF: {e}"
+
+def extraer_lineas_con_ia(texto_pdf):
+    """Usa IA (DeepSeek) para extraer líneas de pedido del texto"""
+    
+    contexto = f"""
+Extrae todas las líneas de pedido del siguiente texto de un pedido de conservas.
+
+Texto del pedido:
+{texto_pdf[:8000]}
+
+Reglas:
+1. Busca SKU (códigos de 6-10 dígitos)
+2. Busca cantidades (normalmente números grandes como 56.000, 35.532)
+3. Detecta si lleva RT (retráctil) - busca "RT10", "RT", "retractil"
+4. Extrae el nombre del producto
+
+Devuelve SOLO un JSON con este formato:
+{{
+    "lineas": [
+        {{
+            "sku": "566188",
+            "nombre": "LULAS DE CALDEIRADA S/E",
+            "cantidad": 56000,
+            "lleva_rt": false
+        }},
+        {{
+            "sku": "3344651041",
+            "nombre": "LULAS DE CALDEIRADA RT10",
+            "cantidad": 22000,
+            "lleva_rt": true
+        }}
+    ]
+}}
+"""
+    try:
+        client = OpenAI(
+            api_key=st.secrets["DEEPSEEK_API_KEY"],
+            base_url="https://api.deepseek.com"
+        )
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "Eres un extractor de datos de pedidos. Responde SOLO con JSON valido."},
+                {"role": "user", "content": contexto}
+            ],
+            temperature=0.1
+        )
+        texto = response.choices[0].message.content
+        if "```json" in texto:
+            texto = texto.split("```json")[1].split("```")[0]
+        elif "```" in texto:
+            texto = texto.split("```")[1].split("```")[0]
+        return json.loads(texto.strip())
+    except Exception as e:
+        st.error(f"Error de IA: {e}")
+        return None
+
+def separar_lineas_trabajo(lineas):
+    """Separa líneas por máquina (E1/E3 para normal, E5 para RT)"""
+    normales = []
+    rt = []
+    
+    for linea in lineas:
+        if linea.get('lleva_rt', False):
+            rt.append(linea)
+        else:
+            normales.append(linea)
+    
+    return {
+        "normales": normales,
+        "rt": rt
+    }
+
 def planificar_con_ia(maquinas, pedidos, clientes, productos):
     if not maquinas or not pedidos:
         return None
@@ -49,9 +140,6 @@ Eres un planificador de produccion en una fabrica de conservas.
 
 ## CLIENTES:
 {json.dumps(clientes, indent=2, ensure_ascii=False)}
-
-## PRODUCTOS:
-{json.dumps(productos, indent=2, ensure_ascii=False)}
 
 ## PEDIDOS:
 {json.dumps(pedidos, indent=2, ensure_ascii=False)}
@@ -104,7 +192,7 @@ with st.spinner("Cargando datos..."):
 # Menu
 menu = st.sidebar.radio(
     "MENU",
-    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 Cargar Pedido", "🤖 IA Planificar"]
+    ["📊 Dashboard", "⚙️ Máquinas", "👥 Clientes", "📦 Productos", "📝 Pedidos", "📄 Subir PDF con IA", "🤖 IA Planificar"]
 )
 
 # ============================================
@@ -151,78 +239,99 @@ elif menu == "📝 Pedidos":
         st.write(f"📄 {p.get('numero')}: {p.get('cantidad')} latas | RT: {'✅' if p.get('lleva_rt') else '❌'}")
 
 # ============================================
-# CARGAR PEDIDO (NUEVO)
+# SUBIR PDF CON IA (NUEVO)
 # ============================================
-elif menu == "📄 Cargar Pedido":
-    st.header("📄 Cargar Pedido desde Texto")
+elif menu == "📄 Subir PDF con IA":
+    st.header("📄 Subir PDF y la IA lo separa en líneas de pedido")
     
-    st.info("📝 Copia y pega el texto del pedido (desde PDF o email)")
+    st.info("""
+    **Cómo funciona:**
+    1. Sube el PDF del pedido
+    2. La IA (DeepSeek) lee y extrae todas las líneas
+    3. Detecta automáticamente SKU, cantidad, y si lleva RT
+    4. Separa las líneas por máquina (E1/E3 para normal, E5 para RT)
+    5. Guarda el pedido en la base de datos
+    """)
     
-    texto_pedido = st.text_area("Texto del pedido:", height=200)
+    archivo_pdf = st.file_uploader("📎 Selecciona el PDF del pedido", type=['pdf'])
     
-    if texto_pedido:
-        lineas = []
+    if archivo_pdf:
+        with st.spinner("📄 Leyendo PDF..."):
+            texto_pdf = extraer_texto_pdf(archivo_pdf)
         
-        for linea in texto_pedido.split('\n'):
-            sku_match = re.search(r'\b(\d{6,10})\b', linea)
-            cantidades = re.findall(r'\b(\d{1,3}(?:\.\d{3})*|\d{4,})\b', linea)
-            cantidad = 0
-            for c in cantidades:
-                num = int(c.replace('.', ''))
-                if 1000 < num < 1000000:
-                    cantidad = num
-                    break
+        if texto_pdf and "Error" not in texto_pdf:
+            st.success(f"✅ PDF leído correctamente ({len(texto_pdf)} caracteres)")
             
-            lleva_rt = 'RT10' in linea or 'retractil' in linea.lower()
+            with st.expander("📄 Texto extraído del PDF"):
+                st.text(texto_pdf[:1000] + "..." if len(texto_pdf) > 1000 else texto_pdf)
             
-            if sku_match and cantidad > 0:
-                sku = sku_match.group(1)
-                lineas.append({
-                    'sku': sku,
-                    'cantidad': cantidad,
-                    'lleva_rt': lleva_rt
-                })
-        
-        if lineas:
-            st.success(f"✅ Se encontraron {len(lineas)} líneas")
-            st.dataframe(pd.DataFrame(lineas), use_container_width=True)
+            with st.spinner("🧠 IA analizando el pedido..."):
+                resultado = extraer_lineas_con_ia(texto_pdf)
             
-            col1, col2 = st.columns(2)
-            with col1:
-                pedido_numero = st.text_input("Número de pedido", "RAF2026/206")
-                fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
-            with col2:
-                opciones_clientes = [c['nombre'] for c in clientes_data] if clientes_data else ["RAMIREZ Y CIA"]
-                cliente = st.selectbox("Cliente", opciones_clientes)
-            
-            # Separar por máquinas
-            rt_total = sum(l['cantidad'] for l in lineas if l['lleva_rt'])
-            normal_total = sum(l['cantidad'] for l in lineas if not l['lleva_rt'])
-            
-            st.subheader("📋 Propuesta de asignación")
-            col_a, col_b, col_c = st.columns(3)
-            col_a.metric("E1 + E3 (normal)", f"{normal_total:,} latas")
-            col_b.metric("E5 (RT)", f"{rt_total:,} latas")
-            col_c.metric("Total", f"{normal_total + rt_total:,} latas")
-            
-            if st.button("💾 Guardar Pedido", type="primary"):
-                cliente_id = 1
-                for c in clientes_data:
-                    if c['nombre'] == cliente:
-                        cliente_id = c['id']
-                        break
+            if resultado and 'lineas' in resultado:
+                lineas = resultado['lineas']
+                st.success(f"✅ IA extrajo {len(lineas)} líneas de pedido")
                 
-                for item in lineas:
-                    insert_data("pedidos", {
-                        "numero": pedido_numero,
-                        "cliente_id": cliente_id,
-                        "fecha_entrega": str(fecha_entrega),
-                        "cantidad": item['cantidad'],
-                        "producto_sku": item['sku'],
-                        "lleva_rt": 1 if item['lleva_rt'] else 0
-                    })
+                # Mostrar líneas extraídas
+                df_lineas = pd.DataFrame(lineas)
+                st.subheader("📋 Líneas extraídas")
+                st.dataframe(df_lineas, use_container_width=True)
                 
-                st.success(f"✅ Pedido {pedido_numero} guardado con {len(lineas)} líneas")
+                # Separar por máquina
+                separacion = separar_lineas_trabajo(lineas)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    total_normales = sum(l['cantidad'] for l in separacion['normales'])
+                    st.metric("E1 / E3 (Sin RT)", f"{total_normales:,} latas")
+                    for l in separacion['normales']:
+                        st.caption(f"📦 {l['sku']}: {l['cantidad']:,} latas")
+                
+                with col2:
+                    total_rt = sum(l['cantidad'] for l in separacion['rt'])
+                    st.metric("E5 (Con RT)", f"{total_rt:,} latas")
+                    for l in separacion['rt']:
+                        st.caption(f"📦 {l['sku']}: {l['cantidad']:,} latas")
+                
+                # Datos del pedido
+                st.subheader("📝 Datos del pedido")
+                col1, col2 = st.columns(2)
+                with col1:
+                    pedido_numero = st.text_input("Número de pedido", "RAF2026/206")
+                    fecha_entrega = st.date_input("Fecha de entrega", datetime.now())
+                with col2:
+                    opciones_clientes = [c['nombre'] for c in clientes_data] if clientes_data else ["RAMIREZ Y CIA"]
+                    cliente = st.selectbox("Cliente", opciones_clientes)
+                
+                if st.button("💾 Guardar Pedido en Base de Datos", type="primary"):
+                    cliente_id = 1
+                    for c in clientes_data:
+                        if c['nombre'] == cliente:
+                            cliente_id = c['id']
+                            break
+                    
+                    for item in lineas:
+                        insert_data("pedidos", {
+                            "numero": pedido_numero,
+                            "cliente_id": cliente_id,
+                            "fecha_entrega": str(fecha_entrega),
+                            "cantidad": item['cantidad'],
+                            "producto_sku": item['sku'],
+                            "lleva_rt": 1 if item.get('lleva_rt', False) else 0
+                        })
+                    
+                    st.success(f"✅ Pedido {pedido_numero} guardado con {len(lineas)} líneas")
+                    
+                    # Resumen final
+                    st.subheader("📊 Resumen de Producción")
+                    total_general = sum(l['cantidad'] for l in lineas)
+                    st.metric("Total latas", f"{total_general:,}")
+                    st.metric("Para E5 (RT)", f"{total_rt:,}")
+                    st.metric("Para E1/E3 (Normal)", f"{total_normales:,}")
+            else:
+                st.error("❌ La IA no pudo extraer las líneas. Intenta con otro PDF o usa la opción de texto manual.")
+        else:
+            st.error(f"❌ {texto_pdf}")
 
 # ============================================
 # IA PLANIFICAR
