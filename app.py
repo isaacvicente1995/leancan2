@@ -14,6 +14,7 @@ st.markdown("""
     h1 { color: #1a365d !important; border-bottom: 3px solid #2c5282 !important; }
     .metric-card { background: linear-gradient(135deg, #1e3a5f 0%, #2c5282 100%); border-radius: 12px; padding: 20px; color: white; }
     .machine-card { background: white; border-radius: 10px; padding: 15px; margin: 10px 0; border-left: 4px solid #2c5282; }
+    .config-card { background: #f7f9fc; border-radius: 10px; padding: 15px; margin: 10px 0; border: 1px solid #e2e8f0; }
     .stButton > button { background-color: #2c5282; color: white; }
     .small-text { font-size: 12px; color: #718096; }
     .speed-table { font-size: 12px; }
@@ -68,36 +69,12 @@ def supabase_delete(table, id_field, id_value):
 # ============================================
 # FUNCIONES DE CÁLCULO
 # ============================================
-def calcular_capacidad_maquina(velocidad, oee, disponibilidad):
-    """Calcula capacidad diaria"""
+def calcular_capacidad_diaria(velocidad, disponibilidad, oee):
+    """Calcula capacidad diaria en latas"""
     minutos_totales = disponibilidad * 60
     capacidad_teorica = velocidad * minutos_totales
     capacidad_real = capacidad_teorica * (oee / 100)
     return int(capacidad_real)
-
-def obtener_velocidad_producto(equipo, producto_tipo, caja_tipo):
-    """Obtiene la velocidad para un producto específico en una máquina"""
-    velocidades = supabase_get("maquinas_velocidades", 
-                                f"equipo=eq.{equipo}&producto_tipo=eq.{producto_tipo}&caja_tipo=eq.{caja_tipo}")
-    if velocidades:
-        return velocidades[0].get('velocidad', 0)
-    return 0
-
-def obtener_maquinas_disponibles():
-    """Obtiene todas las máquinas con sus configuraciones"""
-    maquinas = supabase_get("maquinas_velocidades")
-    resultado = {}
-    for m in maquinas:
-        equipo = m['equipo']
-        if equipo not in resultado:
-            resultado[equipo] = {
-                'velocidades': {},
-                'oee': m.get('oee', 60),
-                'disponibilidad': m.get('disponibilidad', 7.5)
-            }
-        key = f"{m['producto_tipo']}_{m['caja_tipo']}"
-        resultado[equipo]['velocidades'][key] = m['velocidad']
-    return resultado
 
 def extraer_tipo_producto(sku, nombre):
     """Determina el tipo de producto basado en SKU o nombre"""
@@ -143,23 +120,45 @@ def extraer_lineas(texto):
             })
     return lineas
 
-def asignar_maquinas_inteligente(lineas_pedido, maquinas_config):
+def obtener_todas_velocidades():
+    """Obtiene todas las configuraciones de máquinas"""
+    return supabase_get("maquinas_velocidades")
+
+def actualizar_velocidad(id_registro, nueva_velocidad):
+    """Actualiza la velocidad de un registro"""
+    return supabase_put("maquinas_velocidades", "id", id_registro, {"velocidad": nueva_velocidad})
+
+def actualizar_oee_disponibilidad(equipo, nuevo_oee, nueva_disponibilidad):
+    """Actualiza OEE y disponibilidad para todas las velocidades de un equipo"""
+    registros = supabase_get("maquinas_velocidades", f"equipo=eq.{equipo}")
+    for reg in registros:
+        supabase_put("maquinas_velocidades", "id", reg['id'], {
+            "oee": nuevo_oee,
+            "disponibilidad": nueva_disponibilidad
+        })
+
+def asignar_maquinas_inteligente(lineas_pedido, velocidades_config):
     """Asigna productos a máquinas según velocidades específicas"""
     equipos = ['E1', 'E2', 'E3', 'E5', 'E8']
     capacidad_equipo = {}
     carga_equipo = {e: 0 for e in equipos}
     asignaciones = []
     
+    # Agrupar velocidades por equipo
+    velocidades_por_equipo = {}
+    for v in velocidades_config:
+        equipo = v['equipo']
+        if equipo not in velocidades_por_equipo:
+            velocidades_por_equipo[equipo] = []
+        velocidades_por_equipo[equipo].append(v)
+    
     # Calcular capacidad por equipo
     for e in equipos:
-        if e in maquinas_config:
-            conf = maquinas_config[e]
-            # Usar velocidad base (la más común)
-            velocidades = list(conf['velocidades'].values())
-            velocidad_base = max(velocidades) if velocidades else 100
-            capacidad_equipo[e] = calcular_capacidad_maquina(
-                velocidad_base, conf['oee'], conf['disponibilidad']
-            )
+        if e in velocidades_por_equipo and velocidades_por_equipo[e]:
+            vel_max = max(v['velocidad'] for v in velocidades_por_equipo[e])
+            oee = velocidades_por_equipo[e][0].get('oee', 60)
+            disp = velocidades_por_equipo[e][0].get('disponibilidad', 7.5)
+            capacidad_equipo[e] = calcular_capacidad_diaria(vel_max, disp, oee)
         else:
             capacidad_equipo[e] = 30000
     
@@ -172,10 +171,11 @@ def asignar_maquinas_inteligente(lineas_pedido, maquinas_config):
         # Encontrar máquinas que pueden producir este producto
         maquinas_posibles = []
         for e in equipos:
-            if e in maquinas_config:
-                key = f"{producto_tipo}_{caja_tipo}"
-                if key in maquinas_config[e]['velocidades']:
-                    maquinas_posibles.append(e)
+            if e in velocidades_por_equipo:
+                for v in velocidades_por_equipo[e]:
+                    if v['producto_tipo'] == producto_tipo and v['caja_tipo'] == caja_tipo:
+                        maquinas_posibles.append(e)
+                        break
         
         if not maquinas_posibles:
             maquinas_posibles = ['E2'] if not lleva_rt else ['E5']
@@ -209,16 +209,22 @@ with st.spinner("🔄 Cargando datos..."):
     clientes = supabase_get("clientes")
     pedidos = supabase_get("pedidos")
     lineas_pedido = supabase_get("lineas_pedido")
-    maquinas_config = obtener_maquinas_disponibles()
+    todas_velocidades = obtener_todas_velocidades()
 
 # ============================================
-# MENÚ
+# MENÚ (NUEVO ORDEN)
 # ============================================
 st.sidebar.markdown("<h2 style='text-align: center;'>🏭 LeanCan</h2>", unsafe_allow_html=True)
-menu = st.sidebar.radio("", ["📊 PANEL", "🏭 MÁQUINAS", "📅 PLANIFICACIÓN", "📦 PEDIDOS", "📄 IMPORTAR"])
+menu = st.sidebar.radio("", [
+    "📊 PANEL", 
+    "📦 PEDIDOS", 
+    "📄 IMPORTAR", 
+    "📅 PLANIFICACIÓN", 
+    "⚙️ CONFIGURACIÓN MÁQUINAS"
+])
 
 # ============================================
-# PANEL
+# 1. PANEL
 # ============================================
 if menu == "📊 PANEL":
     st.markdown("<h1>Panel de Control</h1>", unsafe_allow_html=True)
@@ -233,86 +239,7 @@ if menu == "📊 PANEL":
         st.dataframe(pd.DataFrame(pedidos[-5:]), use_container_width=True)
 
 # ============================================
-# MÁQUINAS - CON VELOCIDADES POR PRODUCTO
-# ============================================
-elif menu == "🏭 MÁQUINAS":
-    st.markdown("<h1>Configuración de Máquinas</h1>", unsafe_allow_html=True)
-    st.info("""
-    **Velocidades por producto:** Cada máquina tiene velocidades diferentes según el producto que fabrica.
-    """)
-    
-    equipos = supabase_get("maquinas_velocidades")
-    
-    if not equipos:
-        st.warning("No hay configuración de máquinas. Ejecuta el SQL de inserción primero.")
-    else:
-        # Agrupar por equipo
-        equipos_dict = {}
-        for e in equipos:
-            equipo = e['equipo']
-            if equipo not in equipos_dict:
-                equipos_dict[equipo] = []
-            equipos_dict[equipo].append(e)
-        
-        for equipo, configs in equipos_dict.items():
-            with st.expander(f"🖥️ {equipo}", expanded=True):
-                st.markdown(f"**OEE:** {configs[0].get('oee', 60)}% | **Disponibilidad:** {configs[0].get('disponibilidad', 7.5)} horas/día")
-                
-                # Tabla de velocidades
-                df_vel = pd.DataFrame([{
-                    'Producto': f"{c['producto_tipo']} - {c['caja_tipo']}",
-                    'Velocidad (latas/min)': c['velocidad']
-                } for c in configs])
-                st.dataframe(df_vel, use_container_width=True)
-                
-                # Opción de editar (simplificada)
-                nueva_velocidad = st.number_input(
-                    f"Nueva velocidad para {configs[0]['producto_tipo']}-{configs[0]['caja_tipo']}",
-                    value=configs[0]['velocidad'], step=10, key=f"vel_{equipo}"
-                )
-                if st.button(f"Actualizar velocidad {equipo}", key=f"save_{equipo}"):
-                    supabase_put("maquinas_velocidades", "id", configs[0]['id'], {"velocidad": nueva_velocidad})
-                    st.rerun()
-
-# ============================================
-# PLANIFICACIÓN
-# ============================================
-elif menu == "📅 PLANIFICACIÓN":
-    st.markdown("<h1>Planificación de Producción</h1>", unsafe_allow_html=True)
-    
-    if not lineas_pedido:
-        st.warning("⚠️ No hay productos cargados. Importa un pedido primero.")
-    else:
-        if st.button("🚀 RECALCULAR PLANIFICACIÓN", type="primary", use_container_width=True):
-            with st.spinner("Distribuyendo productos entre máquinas según velocidades específicas..."):
-                asignaciones, cargas, porcentajes, capacidades = asignar_maquinas_inteligente(lineas_pedido, maquinas_config)
-            
-            st.success(f"✅ {len(asignaciones)} productos asignados")
-            
-            # Gráfico de carga
-            st.subheader("📊 Carga por Máquina")
-            df_carga = pd.DataFrame([
-                {"Máquina": m, "Latas": cargas[m], "Capacidad": capacidades[m], 
-                 "%": porcentajes[m]}
-                for m in ['E1', 'E2', 'E3', 'E5', 'E8']
-            ])
-            fig = px.bar(df_carga, x="Máquina", y="%", text="%", color="%", 
-                        color_continuous_scale=["green","yellow","red"])
-            fig.update_traces(textposition='outside')
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Tabla de asignaciones
-            st.subheader("📋 Asignación por Máquina")
-            for maquina in ['E1', 'E2', 'E3', 'E5', 'E8']:
-                asig = [a for a in asignaciones if a['maquina'] == maquina]
-                if asig:
-                    with st.expander(f"🖥️ {maquina} - {cargas[maquina]:,} / {capacidades[maquina]:,} latas ({porcentajes[maquina]}%)"):
-                        for a in asig:
-                            rt = " (con RT)" if a['lleva_rt'] else ""
-                            st.write(f"📦 {a['sku']} - {a['nombre'][:40]}: {a['cantidad']:,} latas{rt} | Tipo: {a['producto_tipo']}-{a['caja_tipo']}")
-
-# ============================================
-# PEDIDOS
+# 2. PEDIDOS
 # ============================================
 elif menu == "📦 PEDIDOS":
     st.markdown("<h1>Pedidos</h1>", unsafe_allow_html=True)
@@ -329,7 +256,7 @@ elif menu == "📦 PEDIDOS":
         st.info("No hay pedidos registrados")
 
 # ============================================
-# IMPORTAR PEDIDO
+# 3. IMPORTAR PEDIDO
 # ============================================
 elif menu == "📄 IMPORTAR":
     st.markdown("<h1>Importar Pedido</h1>", unsafe_allow_html=True)
@@ -406,3 +333,123 @@ elif menu == "📄 IMPORTAR":
                 st.error("No se encontraron productos")
         else:
             st.warning("Pega el texto del pedido")
+
+# ============================================
+# 4. PLANIFICACIÓN
+# ============================================
+elif menu == "📅 PLANIFICACIÓN":
+    st.markdown("<h1>Planificación de Producción</h1>", unsafe_allow_html=True)
+    
+    if not lineas_pedido:
+        st.warning("⚠️ No hay productos cargados. Importa un pedido primero.")
+    else:
+        if st.button("🚀 RECALCULAR PLANIFICACIÓN", type="primary", use_container_width=True):
+            with st.spinner("Distribuyendo productos entre máquinas según velocidades específicas..."):
+                asignaciones, cargas, porcentajes, capacidades = asignar_maquinas_inteligente(lineas_pedido, todas_velocidades)
+            
+            st.success(f"✅ {len(asignaciones)} productos asignados")
+            
+            # Gráfico de carga
+            st.subheader("📊 Carga por Máquina")
+            df_carga = pd.DataFrame([
+                {"Máquina": m, "Latas": cargas[m], "Capacidad": capacidades[m], "%": porcentajes[m]}
+                for m in ['E1', 'E2', 'E3', 'E5', 'E8']
+            ])
+            fig = px.bar(df_carga, x="Máquina", y="%", text="%", color="%", 
+                        color_continuous_scale=["green","yellow","red"])
+            fig.update_traces(textposition='outside')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Tabla de asignaciones
+            st.subheader("📋 Asignación por Máquina")
+            for maquina in ['E1', 'E2', 'E3', 'E5', 'E8']:
+                asig = [a for a in asignaciones if a['maquina'] == maquina]
+                if asig:
+                    with st.expander(f"🖥️ {maquina} - {cargas[maquina]:,} / {capacidades[maquina]:,} latas ({porcentajes[maquina]}%)"):
+                        for a in asig:
+                            rt = " (con RT)" if a['lleva_rt'] else ""
+                            st.write(f"📦 {a['sku']} - {a['nombre'][:40]}: {a['cantidad']:,} latas{rt} | Tipo: {a['producto_tipo']}-{a['caja_tipo']}")
+
+# ============================================
+# 5. CONFIGURACIÓN MÁQUINAS (EDITAR TODO)
+# ============================================
+elif menu == "⚙️ CONFIGURACIÓN MÁQUINAS":
+    st.markdown("<h1>Configuración de Máquinas</h1>", unsafe_allow_html=True)
+    
+    st.info("""
+    **Aquí puedes modificar:**
+    - Velocidades por producto (latas/min)
+    - OEE (%) - Efectividad global del equipo
+    - Disponibilidad (horas/día)
+    """)
+    
+    if not todas_velocidades:
+        st.warning("No hay configuración de máquinas. Ejecuta el SQL de inserción primero.")
+    else:
+        # Agrupar por equipo
+        equipos_dict = {}
+        for v in todas_velocidades:
+            equipo = v['equipo']
+            if equipo not in equipos_dict:
+                equipos_dict[equipo] = []
+            equipos_dict[equipo].append(v)
+        
+        # Editar OEE y Disponibilidad global por equipo
+        st.subheader("📊 Parámetros Globales por Equipo")
+        for equipo, configs in equipos_dict.items():
+            with st.expander(f"⚙️ {equipo} - Parámetros Globales", expanded=False):
+                oee_actual = configs[0].get('oee', 60)
+                disp_actual = configs[0].get('disponibilidad', 7.5)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    nuevo_oee = st.number_input(f"OEE (%) - {equipo}", value=oee_actual, step=5, min_value=0, max_value=100, key=f"oee_{equipo}")
+                with col2:
+                    nueva_disp = st.number_input(f"Disponibilidad (h/día) - {equipo}", value=disp_actual, step=0.5, min_value=0.0, max_value=24.0, key=f"disp_{equipo}")
+                
+                if st.button(f"💾 Guardar parámetros {equipo}", key=f"save_global_{equipo}"):
+                    for reg in configs:
+                        supabase_put("maquinas_velocidades", "id", reg['id'], {
+                            "oee": nuevo_oee,
+                            "disponibilidad": nueva_disp
+                        })
+                    st.success(f"✅ Parámetros de {equipo} actualizados")
+                    time.sleep(0.5)
+                    st.rerun()
+        
+        st.markdown("---")
+        
+        # Editar velocidades específicas por producto
+        st.subheader("⚡ Velocidades por Producto")
+        
+        for equipo, configs in equipos_dict.items():
+            with st.expander(f"🖥️ {equipo} - Velocidades por Producto", expanded=False):
+                st.markdown(f"**Configuraciones actuales de {equipo}:**")
+                
+                for cfg in configs:
+                    col1, col2, col3 = st.columns([3, 2, 1])
+                    with col1:
+                        st.write(f"📦 {cfg['producto_tipo']} - {cfg['caja_tipo']}")
+                    with col2:
+                        nueva_vel = st.number_input(
+                            f"Velocidad (latas/min)", 
+                            value=cfg['velocidad'], 
+                            step=10, 
+                            key=f"vel_{cfg['id']}"
+                        )
+                    with col3:
+                        if st.button(f"💾", key=f"save_vel_{cfg['id']}"):
+                            supabase_put("maquinas_velocidades", "id", cfg['id'], {"velocidad": nueva_vel})
+                            st.success(f"✅ Velocidad actualizada")
+                            time.sleep(0.3)
+                            st.rerun()
+                
+                # Mostrar capacidades calculadas
+                st.markdown("---")
+                st.caption(f"**Capacidades calculadas con parámetros actuales:**")
+                for cfg in configs:
+                    vel = cfg['velocidad']
+                    oee = cfg.get('oee', 60)
+                    disp = cfg.get('disponibilidad', 7.5)
+                    cap = calcular_capacidad_diaria(vel, disp, oee)
+                    st.caption(f"  📊 {cfg['producto_tipo']}-{cfg['caja_tipo']}: {vel} latas/min → {cap:,} latas/día")
