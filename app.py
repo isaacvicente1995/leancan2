@@ -4,7 +4,10 @@ import pandas as pd
 from datetime import datetime
 import json
 import re
+import tempfile
+import os
 from openai import OpenAI
+import PyPDF2
 
 st.set_page_config(page_title="LeanCan", page_icon="🥫", layout="wide")
 
@@ -39,12 +42,31 @@ def insert_data(table, data):
         return False
 
 # ============================================
-# EXTRACCIÓN CON OPENROUTER (GRATIS)
+# FUNCIONES PARA LEER PDF
+# ============================================
+def leer_pdf(archivo_pdf):
+    """Extrae texto de un archivo PDF"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(archivo_pdf.getvalue())
+            tmp_path = tmp_file.name
+        
+        texto_completo = ""
+        with open(tmp_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                texto_completo += page.extract_text()
+        
+        os.unlink(tmp_path)
+        return texto_completo
+    except Exception as e:
+        return f"Error al leer PDF: {e}"
+
+# ============================================
+# EXTRACCIÓN CON OPENROUTER (IA)
 # ============================================
 def extraer_con_openrouter(texto_pedido):
-    """
-    Usa OpenRouter con modelo gratuito Qwen 3.6
-    """
+    """Usa OpenRouter con IA para extraer líneas de pedido"""
     if "OPENROUTER_API_KEY" not in st.secrets:
         st.error("❌ No se encontró OPENROUTER_API_KEY en Secrets")
         return None
@@ -55,16 +77,25 @@ def extraer_con_openrouter(texto_pedido):
             api_key=st.secrets["OPENROUTER_API_KEY"],
         )
         
-        prompt = f"""Extrae todas las líneas de pedido del siguiente texto.
-Devuelve SOLO un JSON con este formato:
-{{"lineas": [{{"sku": "codigo", "cantidad": numero, "lleva_rt": true/false}}]}}
+        prompt = f"""Extrae todas las líneas de pedido del siguiente texto de un pedido de conservas.
+        
+Busca:
+- SKU: códigos de 6-10 dígitos como 566188, 556188, 846184, 3344651041
+- Cantidad: números como 56.000, 35.532, 22.000
+- Si lleva RT: busca "RT10" o "retractil"
 
 Texto:
-{texto_pedido[:3000]}
+{texto_pedido[:4000]}
+
+Devuelve SOLO un JSON con este formato:
+{{"lineas": [
+    {{"sku": "566188", "cantidad": 56000, "lleva_rt": false}},
+    {{"sku": "3344651041", "cantidad": 22000, "lleva_rt": true}}
+]}}
 """
         
         response = client.chat.completions.create(
-            model="qwen/qwen3.6-plus-preview:free",
+            model="google/gemma-2-2b-it:free",
             messages=[
                 {"role": "system", "content": "Eres un extractor de pedidos. Responde SOLO con JSON."},
                 {"role": "user", "content": prompt}
@@ -89,7 +120,7 @@ Texto:
         return None
 
 def extraer_lineas_sin_ia(texto):
-    """Método alternativo: extracción con regex (sin IA, ilimitado)"""
+    """Método alternativo: extracción con regex (sin IA)"""
     lineas = []
     for linea in texto.split('\n'):
         sku_match = re.search(r'\b(\d{6,10})\b', linea)
@@ -102,7 +133,7 @@ def extraer_lineas_sin_ia(texto):
                 cantidad = num
                 break
         
-        lleva_rt = 'RT10' in linea or 'RT' in linea.upper()
+        lleva_rt = 'RT10' in linea or 'RT' in linea.upper() or 'retractil' in linea.lower()
         
         if sku_match and cantidad > 0:
             lineas.append({
@@ -282,52 +313,63 @@ elif menu == "📝 Pedidos":
                     st.rerun()
 
 # ============================================
-# CARGAR PEDIDO CON OPENROUTER
+# CARGAR PEDIDO (PDF + TEXTO)
 # ============================================
 elif menu == "📄 Cargar Pedido":
-    st.header("📄 Cargar Pedido con OpenRouter (Gratis)")
+    st.header("📄 Cargar Pedido")
     
     st.info("""
-    🤖 **OpenRouter - Modelos gratuitos**
-    - Usa el modelo Qwen 3.6 (1M contexto)
-    - 50 peticiones/día gratis
-    - Sin tarjeta de crédito
+    **Dos formas de cargar el pedido:**
+    1. 📎 **Subir PDF** - La IA leerá el archivo automáticamente
+    2. 📝 **Pegar texto** - Si prefieres copiar y pegar manualmente
     """)
     
-    with st.expander("📋 Ejemplo - Copia este texto"):
-        st.code("""
-566188 RR-120 LULAS DE CALDEIRADAS/E 56.000
-556188 RR-120 LULAS RECHEADAS CALDEIRADAS/E 35.532
-846184 RR-120 POTA GIGANTE EM CALDEIRADAS/E 23.688
-846120 RR-120 POTA GIGANTE C/ALHOS/E 5.922
-3344651041 RR-120 LULAS DE CALDEIRADART10 GENERAL 22.000
-3344651058 RR-120 LULAS RECHEADAS EM CALDEIRADART10 GENERAL 17.600
-4641035 RR-120 POTA GIGANTE EM CALDEIRADART10 GENERAL 4.400
-3344651065 RR-120 CHOQUINHOS RECHEADOS COM TINTART10 GENERAL 8.800
-        """)
+    # Opción 1: Subir PDF
+    st.subheader("📎 Opción 1: Subir archivo PDF")
+    archivo_pdf = st.file_uploader("Selecciona el PDF del pedido", type=['pdf'])
     
-    texto_pedido = st.text_area("Pega aquí el texto del pedido:", height=200)
+    texto_extraido = None
     
-    col1, col2 = st.columns(2)
-    with col1:
-        usar_ia = st.checkbox("Usar IA de OpenRouter", value=True, 
-                              help="Más preciso, consume petición gratuita. 50 req/día")
-    with col2:
-        if usar_ia and "OPENROUTER_API_KEY" not in st.secrets:
-            st.warning("⚠️ Sin API key. Añade OPENROUTER_API_KEY a Secrets")
+    if archivo_pdf:
+        with st.spinner("Leyendo PDF..."):
+            texto_extraido = leer_pdf(archivo_pdf)
+        
+        if texto_extraido and "Error" not in texto_extraido:
+            st.success(f"✅ PDF leído correctamente ({len(texto_extraido)} caracteres)")
+            with st.expander("Ver texto extraído del PDF"):
+                st.text(texto_extraido[:1000] + "..." if len(texto_extraido) > 1000 else texto_extraido)
+        else:
+            st.error(f"❌ {texto_extraido}")
     
-    if st.button("📊 Procesar Pedido", type="primary"):
-        if texto_pedido:
-            with st.spinner("Procesando..." if not usar_ia else "🧠 OpenRouter IA analizando..."):
+    # Opción 2: Pegar texto
+    st.subheader("📝 Opción 2: Pegar texto manualmente")
+    texto_manual = st.text_area("Pega aquí el texto del pedido:", height=150)
+    
+    # Decidir qué texto usar
+    texto_final = texto_extraido if texto_extraido and "Error" not in texto_extraido else texto_manual
+    
+    if texto_final:
+        st.subheader("🔧 Procesar pedido")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            usar_ia = st.checkbox("Usar IA (OpenRouter)", value=False, 
+                                  help="Más preciso pero consume crédito. Desactiva para usar método rápido sin IA")
+        with col2:
+            if usar_ia and "OPENROUTER_API_KEY" not in st.secrets:
+                st.warning("⚠️ Sin API key. Añade OPENROUTER_API_KEY a Secrets")
+        
+        if st.button("📊 Procesar Pedido", type="primary"):
+            with st.spinner("Procesando..." if not usar_ia else "🧠 IA analizando..."):
                 if usar_ia and "OPENROUTER_API_KEY" in st.secrets:
-                    resultado = extraer_con_openrouter(texto_pedido)
+                    resultado = extraer_con_openrouter(texto_final)
                     if resultado and 'lineas' in resultado:
                         lineas = resultado['lineas']
                     else:
                         st.warning("La IA no respondió. Usando método alternativo...")
-                        lineas = extraer_lineas_sin_ia(texto_pedido)
+                        lineas = extraer_lineas_sin_ia(texto_final)
                 else:
-                    lineas = extraer_lineas_sin_ia(texto_pedido)
+                    lineas = extraer_lineas_sin_ia(texto_final)
             
             if lineas:
                 st.success(f"✅ Se encontraron {len(lineas)} líneas")
@@ -351,7 +393,7 @@ elif menu == "📄 Cargar Pedido":
                     opciones = [c['nombre'] for c in clientes_data] if clientes_data else ["RAMIREZ Y CIA"]
                     cliente = st.selectbox("Cliente", opciones)
                 
-                if st.button("💾 Guardar Pedido"):
+                if st.button("💾 Guardar Pedido", type="primary"):
                     cliente_id = 1
                     for c in clientes_data:
                         if c['nombre'] == cliente:
@@ -370,10 +412,11 @@ elif menu == "📄 Cargar Pedido":
                     
                     st.success(f"✅ Pedido {pedido_numero} guardado con {len(lineas)} líneas")
                     st.balloons()
+                    st.balloons()
             else:
-                st.error("❌ No se encontraron líneas.")
-        else:
-            st.warning("⚠️ Pega el texto del pedido primero")
+                st.error("❌ No se encontraron líneas. Verifica el formato del texto.")
+    elif archivo_pdf and texto_extraido and "Error" in texto_extraido:
+        st.error("No se pudo leer el PDF. Prueba con la opción de pegar texto.")
 
 # ============================================
 # IA PLANIFICAR
