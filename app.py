@@ -14,6 +14,7 @@ st.markdown("""
     h1 { color: #1a365d !important; border-bottom: 3px solid #2c5282 !important; }
     .metric-card { background: linear-gradient(135deg, #1e3a5f 0%, #2c5282 100%); border-radius: 12px; padding: 20px; color: white; }
     .machine-card { background: white; border-radius: 10px; padding: 15px; margin: 10px 0; border-left: 4px solid #2c5282; }
+    .machine-edit { background: #f7f9fc; border-radius: 8px; padding: 10px; margin: 5px 0; }
     .stButton > button { background-color: #2c5282; color: white; }
 </style>
 """, unsafe_allow_html=True)
@@ -30,9 +31,12 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-def supabase_get(table):
+def supabase_get(table, filters=None):
+    url = f"{SUPABASE_URL}/{table}"
+    if filters:
+        url += f"?{filters}"
     try:
-        response = requests.get(f"{SUPABASE_URL}/{table}", headers=HEADERS)
+        response = requests.get(url, headers=HEADERS)
         if response.status_code == 200:
             return response.json()
         return []
@@ -46,8 +50,15 @@ def supabase_post(table, data):
     except:
         return False
 
+def supabase_put(table, id_field, id_value, data):
+    try:
+        response = requests.patch(f"{SUPABASE_URL}/{table}?{id_field}=eq.{id_value}", headers=HEADERS, json=data)
+        return response.status_code in [200, 204]
+    except:
+        return False
+
 # ============================================
-# FUNCIONES
+# FUNCIONES DE PLANIFICACIÓN
 # ============================================
 def extraer_lineas(texto):
     """Extrae productos del pedido"""
@@ -81,9 +92,18 @@ def extraer_lineas(texto):
             })
     return lineas
 
-def asignar_maquinas(lineas_pedido):
-    """Asigna cada producto a la máquina adecuada"""
+def obtener_capacidades_maquinas():
+    """Obtiene las capacidades actuales de las máquinas desde Supabase"""
+    maquinas = supabase_get("maquinas")
     capacidades = {'E1': 54000, 'E2': 32400, 'E3': 54000, 'E5': 33750, 'E8': 48600}
+    for m in maquinas:
+        nombre = m.get('nombre')
+        if nombre in capacidades:
+            capacidades[nombre] = m.get('capacidad', capacidades[nombre])
+    return capacidades
+
+def asignar_maquinas(lineas_pedido, capacidades):
+    """Asigna cada producto a la máquina adecuada según capacidades actuales"""
     carga = {'E1': 0, 'E2': 0, 'E3': 0, 'E5': 0, 'E8': 0}
     asignaciones = []
     
@@ -104,7 +124,7 @@ def asignar_maquinas(lineas_pedido):
         else:
             # Distribuir entre E1, E2, E3 según carga actual
             opciones = ['E1', 'E2', 'E3']
-            opciones_ordenadas = sorted(opciones, key=lambda m: carga[m])
+            opciones_ordenadas = sorted(opciones, key=lambda m: carga[m] / capacidades[m] if capacidades[m] > 0 else 0)
             maquina = opciones_ordenadas[0]
             asignaciones.append({
                 'sku': linea['sku'],
@@ -115,7 +135,12 @@ def asignar_maquinas(lineas_pedido):
             })
             carga[maquina] += cantidad
     
-    return asignaciones, carga, capacidades
+    # Calcular porcentajes
+    porcentajes = {}
+    for m in capacidades:
+        porcentajes[m] = round((carga[m] / capacidades[m]) * 100, 1) if capacidades[m] > 0 else 0
+    
+    return asignaciones, carga, porcentajes
 
 # ============================================
 # CARGA DE DATOS
@@ -124,7 +149,23 @@ with st.spinner("🔄 Cargando datos..."):
     clientes = supabase_get("clientes")
     pedidos = supabase_get("pedidos")
     lineas_pedido = supabase_get("lineas_pedido")
-    asignaciones_db = supabase_get("asignaciones")
+    maquinas_db = supabase_get("maquinas")
+    
+    # Si no hay máquinas en la BD, crear las predeterminadas
+    if not maquinas_db:
+        maquinas_default = [
+            {"nombre": "E1", "velocidad": 200, "capacidad": 54000, "formato": "RR-120"},
+            {"nombre": "E2", "velocidad": 120, "capacidad": 32400, "formato": "RR-120/RR-90"},
+            {"nombre": "E3", "velocidad": 200, "capacidad": 54000, "formato": "RR-120"},
+            {"nombre": "E5", "velocidad": 125, "capacidad": 33750, "formato": "RT"},
+            {"nombre": "E8", "velocidad": 180, "capacidad": 48600, "formato": "RO-85"}
+        ]
+        for m in maquinas_default:
+            supabase_post("maquinas", m)
+        maquinas_db = supabase_get("maquinas")
+
+# Obtener capacidades actuales
+capacidades_maquinas = obtener_capacidades_maquinas()
 
 # ============================================
 # MENÚ
@@ -148,26 +189,62 @@ if menu == "📊 PANEL":
         st.dataframe(pd.DataFrame(pedidos[-5:]), use_container_width=True)
 
 # ============================================
-# MÁQUINAS
+# MÁQUINAS - CON EDICIÓN
 # ============================================
 elif menu == "🏭 MÁQUINAS":
-    st.markdown("<h1>Líneas de Producción</h1>", unsafe_allow_html=True)
+    st.markdown("<h1>Configuración de Máquinas</h1>", unsafe_allow_html=True)
+    st.info("✏️ Modifica los datos de las máquinas y la planificación se recalculará automáticamente")
     
-    maquinas_info = {
-        'E1': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000},
-        'E2': {'formato': 'RR-120/RR-90', 'velocidad': 120, 'capacidad': 32400},
-        'E3': {'formato': 'RR-120', 'velocidad': 200, 'capacidad': 54000},
-        'E5': {'formato': 'RT (Retráctil)', 'velocidad': 125, 'capacidad': 33750},
-        'E8': {'formato': 'RO-85', 'velocidad': 180, 'capacidad': 48600}
-    }
+    maquinas_info = supabase_get("maquinas")
     
-    for maq, info in maquinas_info.items():
-        st.markdown(f"""
-        <div class="machine-card">
-            <div style="font-size: 20px; font-weight: bold;">{maq}</div>
-            <div>📦 Formato: {info['formato']} | ⚡ Velocidad: {info['velocidad']} latas/min | 🏭 Capacidad: {info['capacidad']:,} latas/día</div>
-        </div>
-        """, unsafe_allow_html=True)
+    if not maquinas_info:
+        st.warning("No hay máquinas configuradas")
+    else:
+        cambios_realizados = False
+        
+        for maq in maquinas_info:
+            with st.expander(f"🖥️ {maq.get('nombre', 'N/A')} - {maq.get('formato', 'N/A')}", expanded=True):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    nueva_velocidad = st.number_input(
+                        "Velocidad (latas/min)", 
+                        value=int(maq.get('velocidad', 100)), 
+                        step=10, 
+                        key=f"vel_{maq['id']}"
+                    )
+                
+                with col2:
+                    nueva_capacidad = st.number_input(
+                        "Capacidad diaria (latas)", 
+                        value=int(maq.get('capacidad', 30000)), 
+                        step=1000, 
+                        key=f"cap_{maq['id']}"
+                    )
+                
+                with col3:
+                    nuevo_formato = st.text_input(
+                        "Formato compatible", 
+                        value=maq.get('formato', ''), 
+                        key=f"fmt_{maq['id']}"
+                    )
+                
+                if st.button(f"💾 Guardar cambios {maq['nombre']}", key=f"save_{maq['id']}"):
+                    update_data = {
+                        "velocidad": nueva_velocidad,
+                        "capacidad": nueva_capacidad,
+                        "formato": nuevo_formato
+                    }
+                    if supabase_put("maquinas", "id", maq['id'], update_data):
+                        st.success(f"✅ Máquina {maq['nombre']} actualizada")
+                        cambios_realizados = True
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error("Error al guardar")
+        
+        if cambios_realizados:
+            st.info("🔄 Las capacidades se han actualizado. Ve a 'PLANIFICACIÓN' para recalcular.")
 
 # ============================================
 # PLANIFICACIÓN
@@ -175,20 +252,27 @@ elif menu == "🏭 MÁQUINAS":
 elif menu == "📅 PLANIFICACIÓN":
     st.markdown("<h1>Planificación de Producción</h1>", unsafe_allow_html=True)
     
+    # Mostrar capacidades actuales
+    st.subheader("📊 Capacidades actuales de las máquinas")
+    cols = st.columns(5)
+    for i, (maq, cap) in enumerate(capacidades_maquinas.items()):
+        with cols[i]:
+            st.metric(maq, f"{cap:,} latas/día")
+    
     if not lineas_pedido:
         st.warning("⚠️ No hay productos cargados. Importa un pedido primero.")
     else:
-        if st.button("🚀 GENERAR PLANIFICACIÓN", type="primary", use_container_width=True):
-            with st.spinner("Distribuyendo productos entre máquinas..."):
-                asignaciones, cargas, capacidades = asignar_maquinas(lineas_pedido)
+        if st.button("🚀 RECALCULAR PLANIFICACIÓN", type="primary", use_container_width=True):
+            with st.spinner("Distribuyendo productos entre máquinas según capacidades actuales..."):
+                asignaciones, cargas, porcentajes = asignar_maquinas(lineas_pedido, capacidades_maquinas)
             
             st.success(f"✅ {len(asignaciones)} productos asignados")
             
             # Gráfico de carga
             st.subheader("📊 Carga por Máquina")
             df_carga = pd.DataFrame([
-                {"Máquina": m, "Latas": cargas[m], "Capacidad": capacidades[m], "%": round(cargas[m]/capacidades[m]*100, 1)}
-                for m in cargas
+                {"Máquina": m, "Latas": cargas[m], "Capacidad": capacidades_maquinas[m], "%": porcentajes[m]}
+                for m in capacidades_maquinas
             ])
             fig = px.bar(df_carga, x="Máquina", y="%", text="%", color="%", color_continuous_scale=["green","yellow","red"])
             fig.update_traces(textposition='outside')
@@ -199,20 +283,27 @@ elif menu == "📅 PLANIFICACIÓN":
             for maquina in ['E1', 'E2', 'E3', 'E5', 'E8']:
                 asig = [a for a in asignaciones if a['maquina'] == maquina]
                 if asig:
-                    with st.expander(f"🖥️ {maquina} - {cargas[maquina]:,} / {capacidades[maquina]:,} latas ({round(cargas[maquina]/capacidades[maquina]*100,1)}%)"):
+                    with st.expander(f"🖥️ {maquina} - {cargas[maquina]:,} / {capacidades_maquinas[maquina]:,} latas ({porcentajes[maquina]}%)"):
                         for a in asig:
                             rt = " (con RT)" if a['lleva_rt'] else ""
                             st.write(f"📦 {a['sku']} - {a['nombre'][:40]}: {a['cantidad']:,} latas{rt}")
             
-            # Guardar asignaciones
-            if st.button("💾 GUARDAR PLANIFICACIÓN"):
+            # Guardar asignaciones en sesión
+            st.session_state['ultima_planificacion'] = {
+                'asignaciones': asignaciones,
+                'cargas': cargas,
+                'porcentajes': porcentajes
+            }
+            
+            # Opción de guardar en BD
+            if st.button("💾 GUARDAR PLANIFICACIÓN EN BD"):
                 for a in asignaciones:
                     supabase_post("asignaciones", {
                         "maquina": a['maquina'],
                         "cantidad_asignada": a['cantidad'],
                         "fecha_programada": str(datetime.now().date())
                     })
-                st.success("Planificación guardada")
+                st.success("Planificación guardada en la base de datos")
 
 # ============================================
 # PEDIDOS
@@ -222,9 +313,8 @@ elif menu == "📦 PEDIDOS":
     
     if pedidos:
         df_ped = pd.DataFrame(pedidos)
-        st.dataframe(df_ped[['numero', 'cliente_id', 'fecha_entrega', 'estado']], use_container_width=True)
+        st.dataframe(df_ped[['id', 'numero', 'cliente_id', 'fecha_entrega', 'estado']], use_container_width=True)
         
-        # Mostrar líneas de cada pedido
         if lineas_pedido:
             st.subheader("📋 Productos por Pedido")
             df_lineas = pd.DataFrame(lineas_pedido)
@@ -268,7 +358,6 @@ elif menu == "📄 IMPORTAR":
             if lineas:
                 st.success(f"✅ {len(lineas)} productos extraídos")
                 
-                # Obtener cliente_id
                 cliente_id = None
                 for c in clientes:
                     if c['nombre'] == cliente:
@@ -276,9 +365,8 @@ elif menu == "📄 IMPORTAR":
                         break
                 
                 if cliente_id is None:
-                    st.error("❌ Cliente no encontrado. Ve a Supabase y añade el cliente.")
+                    st.error("❌ Cliente no encontrado")
                 else:
-                    # Guardar cabecera del pedido
                     pedido_data = {
                         "numero": pedido_numero,
                         "cliente_id": cliente_id,
@@ -287,7 +375,6 @@ elif menu == "📄 IMPORTAR":
                     }
                     
                     if supabase_post("pedidos", pedido_data):
-                        # Obtener el ID del pedido recién creado
                         pedidos_actualizados = supabase_get("pedidos")
                         pedido_id = None
                         for p in pedidos_actualizados:
@@ -296,7 +383,6 @@ elif menu == "📄 IMPORTAR":
                                 break
                         
                         if pedido_id:
-                            # Guardar cada línea
                             for item in lineas:
                                 linea_data = {
                                     "pedido_id": pedido_id,
